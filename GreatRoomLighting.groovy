@@ -6,7 +6,7 @@
  *
  *  Author: Claude (for Ashwin)
  *  Date: 2026-02-12
- *  Version: 1.27 - Add 10-minute hysteresis before turning off when bright
+ *  Version: 1.28 - Optimizations: zone dimming touches only LR ceiling, skip redundant all-off, dedupe night logging
  */
 
 definition(
@@ -22,6 +22,8 @@ definition(
 preferences {
     page(name: "mainPage")
 }
+
+def appVersion() { return "1.28" }
 
 def mainPage() {
     dynamicPage(name: "mainPage", title: "Great Room Lighting Controller", install: true, uninstall: true) {
@@ -214,7 +216,7 @@ def delayedInitialEvaluation() {
     log.info "Initialization complete. State: presence=${state.presenceActive}, lightNeeded=${state.lightNeeded}, mode=${location.mode}, paused=${appPaused}"
     
     // Log initialization to Google Sheets
-    safeLogToSheet("init", "complete", "App started v1.25", currentLux)
+    safeLogToSheet("init", "complete", "App started v${appVersion()}", currentLux)
     
     // Check if paused
     if (appPaused) {
@@ -581,15 +583,10 @@ def livingRoomPresenceHandler(evt) {
         def currentLux = luxSensor?.currentIlluminance ?: 0
         
         if (evt.value == "active") {
-            // Cancel any pending dim and immediately brighten
+            // Cancel any pending dim and immediately brighten (LR ceiling only)
             unschedule(applyLrDimmed)
             safeLogToSheet("zone", "LR active", "brightening", currentLux)
-            
-            if (location.mode == "Night" || location.mode == "Evening") {
-                applyNightScene()
-            } else {
-                applyDayScene()
-            }
+            applyLrZoneLevel(true)
         } else {
             // Delay before dimming to avoid flicker
             logDebug "LR inactive - will dim in 15 seconds"
@@ -606,13 +603,18 @@ def applyLrDimmed() {
     if (mmwaveState == "inactive" && lightsOn && !state.manualOverride && !state.tvTimeActive) {
         def currentLux = luxSensor?.currentIlluminance ?: 0
         safeLogToSheet("zone", "LR inactive", "dimming", currentLux)
-        
-        if (location.mode == "Night" || location.mode == "Evening") {
-            applyNightScene()
-        } else {
-            applyDayScene()
-        }
+        applyLrZoneLevel(false)
     }
+}
+
+def applyLrZoneLevel(Boolean occupied) {
+    // Zone dimming touches ONLY the LR ceiling - other lights keep their scene levels
+    def isNightish = (location.mode == "Night" || location.mode == "Evening")
+    def fullLevel = isNightish ? (nightHueLevel ?: 100) : (dayHueLevel ?: 100)
+    def lrLevel = occupied ? fullLevel : 50
+    state.lastAutomationAction = now()
+    lrHueLights?.setLevel(lrLevel)
+    logDebug "LR zone level -> ${lrLevel}% (${occupied ? 'occupied' : 'unoccupied'})"
 }
 
 def modeHandler(evt) {
@@ -796,8 +798,6 @@ def applyNightScene() {
     logDebug "Night scene applied"
     log.info "Night scene applied (LR ${lrOccupied ? 'occupied' : 'unoccupied'}, dining ${diningLevel}%)"
     safeLogToSheet("scene", "Night", "LR ${lrOccupied ? '100%' : '50%'} dining ${diningLevel}%", currentLux)
-    log.info "Night scene applied (LR ${lrOccupied ? 'occupied' : 'unoccupied'})"
-    safeLogToSheet("scene", "Night", "LR ${lrOccupied ? '100%' : '50%'}", currentLux)
 }
 
 def applyTvScene() {
@@ -829,6 +829,13 @@ def applyTvScene() {
 }
 
 def turnAllLightsOff() {
+    // Skip when everything is already off - avoids repeated radio commands and duplicate log rows
+    def anyOn = [diningSwitch, hallwaySwitch, kitchenCans, kitchenPendant,
+                 bookcaseGOLamp, bookcaseColorLamp, lrHueLights, activatorSwitch].any { it?.currentSwitch == "on" }
+    if (!anyOn) {
+        logDebug "turnAllLightsOff: everything already off - skipping"
+        return
+    }
     state.lastAutomationAction = now()
     state.turningOff = true
     def currentLux = luxSensor?.currentIlluminance ?: 0
