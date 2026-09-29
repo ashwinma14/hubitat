@@ -6,7 +6,7 @@
  *
  *  Author: Claude (for Ashwin)
  *  Date: 2026-02-12
- *  Version: 1.29 - Anti-flap zone dimming (dim delay + bright-hold), predawn gentle-wake scene before 6:15am
+ *  Version: 1.30 - Athom staleness guard with dead-sensor alerts, evening wind-down scene
  */
 
 definition(
@@ -23,7 +23,7 @@ preferences {
     page(name: "mainPage")
 }
 
-def appVersion() { return "1.29" }
+def appVersion() { return "1.30" }
 
 def mainPage() {
     dynamicPage(name: "mainPage", title: "Great Room Lighting Controller", install: true, uninstall: true) {
@@ -84,11 +84,25 @@ def mainPage() {
             input "predawnHueLevel", "number", title: "LR Hue lights brightness", defaultValue: 30
         }
 
+        section("<b>Scene Settings - Wind-down (evening)</b>") {
+            input "windDownStart", "text", title: "Wind-down starts at (HH:mm, 24h)", defaultValue: "21:30", required: true
+            input "windDownDiningLevel", "number", title: "Dining brightness", defaultValue: 30
+            input "windDownHallwayLevel", "number", title: "Hallway brightness", defaultValue: 40
+            input "windDownKitchenPendantLevel", "number", title: "Kitchen Pendant brightness", defaultValue: 15
+            input "windDownBookcaseLevel", "number", title: "Bookcase lamps brightness", defaultValue: 10
+            input "windDownHueLevel", "number", title: "LR Hue lights brightness", defaultValue: 50
+        }
+
         section("<b>Scene Settings - TV Time</b>") {
             input "tvBookcaseLevel", "number", title: "Bookcase lamps brightness", defaultValue: 15
             input "tvOtherLightsOff", "bool", title: "Turn off other lights?", defaultValue: true
         }
         
+        section("<b>Sensor Health</b>") {
+            input "athomStaleMinutes", "number", title: "Treat Athom as dead after no events for (minutes)", defaultValue: 30, required: true
+            input "notifyDevices", "capability.notification", title: "Notify these devices on sensor failure/recovery", multiple: true, required: false
+        }
+
         section("<b>Logging</b>") {
             input "logEnable", "bool", title: "Enable debug logging", defaultValue: true
             input "logEnableMinutes", "number", title: "Disable debug logging after (minutes, 0=never)", defaultValue: 30
@@ -213,7 +227,17 @@ def initialize() {
     // Re-evaluate lighting when the predawn window ends
     def peParts = (predawnEnd ?: "06:15").split(":")
     schedule("0 ${peParts[1] as Integer} ${peParts[0] as Integer} * * ?", predawnEnded)
-    
+
+    // Re-evaluate lighting when the wind-down window opens
+    def wdParts = (windDownStart ?: "21:30").split(":")
+    schedule("0 ${wdParts[1] as Integer} ${wdParts[0] as Integer} * * ?", windDownStarted)
+
+    // Watch the Athom for silent failures
+    if (livingRoomPresence) {
+        state.athomStaleAlerted = false
+        runEvery15Minutes(checkSensorHealth)
+    }
+
     // Auto-disable logging after specified time
     if (logEnable && logEnableMinutes && logEnableMinutes > 0) {
         runIn(logEnableMinutes * 60, disableLogging)
@@ -243,7 +267,7 @@ def delayedInitialEvaluation() {
     if (state.presenceActive && state.lightNeeded && !state.manualOverride && !state.tvTimeActive) {
         log.info "Conditions warrant lights on - applying scene"
         if (location.mode == "Night") {
-            if (isPredawn()) { applyPredawnScene() } else { applyNightScene() }
+            if (isPredawn()) { applyPredawnScene() } else if (isWindDown()) { applyWindDownScene() } else { applyNightScene() }
         } else {
             applyDayScene()
         }
@@ -343,6 +367,62 @@ def predawnEnded() {
     }
 }
 
+def isWindDown() {
+    // True at/after the configured wind-down start time (default 21:30), hub-local time
+    def parts = (windDownStart ?: "21:30").split(":")
+    def startMins = (parts[0] as Integer) * 60 + (parts[1] as Integer)
+    def cal = java.util.Calendar.getInstance(location.timeZone)
+    def nowMins = cal.get(java.util.Calendar.HOUR_OF_DAY) * 60 + cal.get(java.util.Calendar.MINUTE)
+    return nowMins >= startMins
+}
+
+def windDownStarted() {
+    // Wind-down window just opened - ease the lights down if someone is around
+    if (state.presenceActive && !state.manualOverride && !state.tvTimeActive) {
+        evaluateLighting("wind-down started")
+    }
+}
+
+def isAthomStale() {
+    // True when the Athom has not sent ANY event recently - its readings can't be trusted.
+    // The sensor floods illuminance events when alive, so silence means it's dead/throttled.
+    if (!livingRoomPresence) return false
+    try {
+        def last = livingRoomPresence.getLastActivity()
+        if (last == null) return true
+        def staleMs = (athomStaleMinutes ?: 30) * 60 * 1000
+        return (now() - last.time) > staleMs
+    } catch (e) {
+        logDebug "isAthomStale check failed: ${e.message}"
+        return false
+    }
+}
+
+def checkSensorHealth() {
+    if (!livingRoomPresence) return
+    def stale = isAthomStale()
+    if (stale && !state.athomStaleAlerted) {
+        state.athomStaleAlerted = true
+        def mins = athomStaleMinutes ?: 30
+        log.warn "Athom presence sensor is stale - no events for over ${mins} minutes. Power cycle it, then click Initialize on the device."
+        notifyAll("Great Room: Athom presence sensor looks dead (no events for ${mins}+ min). Power cycle it, then click Initialize on device 364.")
+        safeLogToSheet("health", "stale", "Athom silent ${mins}+ min", 0)
+    } else if (!stale && state.athomStaleAlerted) {
+        state.athomStaleAlerted = false
+        log.info "Athom presence sensor recovered - events flowing again"
+        notifyAll("Great Room: Athom presence sensor is reporting again.")
+        safeLogToSheet("health", "recovered", "Athom reporting again", 0)
+    }
+}
+
+def notifyAll(String msg) {
+    try {
+        notifyDevices?.each { it.deviceNotification(msg) }
+    } catch (e) {
+        log.warn "Notification failed: ${e.message}"
+    }
+}
+
 def isTruePresenceDetected() {
     // Check mmWave/radar presence attributes (not just PIR motion)
     // These detect sitting still, unlike motion sensors
@@ -350,11 +430,15 @@ def isTruePresenceDetected() {
     def athomPresent = false
     def fp1ePresent = false
     
-    // Check Athom mmwave attribute
+    // Check Athom mmwave attribute (ignored when the sensor has gone silent)
     if (livingRoomPresence) {
-        def mmwave = livingRoomPresence.currentValue("mmwave")
-        athomPresent = (mmwave == "active")
-        logDebug "Athom mmwave: ${mmwave} -> ${athomPresent ? 'present' : 'not present'}"
+        if (isAthomStale()) {
+            logDebug "Athom stale - ignoring its mmwave reading"
+        } else {
+            def mmwave = livingRoomPresence.currentValue("mmwave")
+            athomPresent = (mmwave == "active")
+            logDebug "Athom mmwave: ${mmwave} -> ${athomPresent ? 'present' : 'not present'}"
+        }
     }
     
     // Check FP1E roomState attribute
@@ -627,6 +711,12 @@ def livingRoomPresenceHandler(evt) {
 }
 
 def applyLrDimmed() {
+    // Never dim on a dead sensor's last word - fail bright
+    if (isAthomStale()) {
+        logDebug "Athom stale - skipping LR dim (fail bright)"
+        return
+    }
+
     // Verify still inactive and conditions still apply
     def mmwaveState = livingRoomPresence?.currentValue("mmwave")
     def lightsOn = lrHueLights?.currentSwitch == "on"
@@ -653,7 +743,7 @@ def applyLrDimmed() {
 def applyLrZoneLevel(Boolean occupied) {
     // Zone dimming touches ONLY the LR ceiling - other lights keep their scene levels
     def isNightish = (location.mode == "Night" || location.mode == "Evening")
-    def fullLevel = isNightish ? ((isPredawn() ? (predawnHueLevel ?: 30) : (nightHueLevel ?: 100))) : (dayHueLevel ?: 100)
+    def fullLevel = isNightish ? (isPredawn() ? (predawnHueLevel ?: 30) : (isWindDown() ? (windDownHueLevel ?: 50) : (nightHueLevel ?: 100))) : (dayHueLevel ?: 100)
     def lrLevel = occupied ? fullLevel : ((fullLevel * 50 / 100) as Integer)
     if (occupied) {
         state.lastLrBrightenTime = now()
@@ -768,13 +858,21 @@ def evaluateLighting(String reason) {
         if (isPredawn()) {
             logDebug "Night mode (predawn) - applying predawn scene"
             applyPredawnScene()
+        } else if (isWindDown()) {
+            logDebug "Night mode (wind-down) - applying wind-down scene"
+            applyWindDownScene()
         } else {
             logDebug "Night mode - applying night scene"
             applyNightScene()
         }
     } else if (location.mode == "Evening") {
-        logDebug "Evening mode - applying night scene"
-        applyNightScene()
+        if (isWindDown()) {
+            logDebug "Evening mode (wind-down) - applying wind-down scene"
+            applyWindDownScene()
+        } else {
+            logDebug "Evening mode - applying night scene"
+            applyNightScene()
+        }
     } else {
         logDebug "Other mode (${location.mode}) - applying day scene"
         applyDayScene()
@@ -788,7 +886,7 @@ def applyDayScene() {
     def currentLux = luxSensor?.currentIlluminance ?: 0
     
     // Check if living room is occupied (default to true if sensor not configured)
-    def lrOccupied = livingRoomPresence ? (livingRoomPresence.currentValue("mmwave") == "active") : true
+    def lrOccupied = (livingRoomPresence && !isAthomStale()) ? (livingRoomPresence.currentValue("mmwave") == "active") : true
     def lrLevel = lrOccupied ? (dayHueLevel ?: 100) : 50
     
     // Get ambient-based dining level
@@ -824,7 +922,7 @@ def applyNightScene() {
     def currentLux = luxSensor?.currentIlluminance ?: 0
     
     // Check if living room is occupied (default to true if sensor not configured)
-    def lrOccupied = livingRoomPresence ? (livingRoomPresence.currentValue("mmwave") == "active") : true
+    def lrOccupied = (livingRoomPresence && !isAthomStale()) ? (livingRoomPresence.currentValue("mmwave") == "active") : true
     def lrLevel = lrOccupied ? (nightHueLevel ?: 100) : 50
     
     // Get ambient-based dining level (will be 100% at night since outdoor lux is low)
@@ -859,7 +957,7 @@ def applyPredawnScene() {
     state.lastAutomationAction = now()
     def currentLux = luxSensor?.currentIlluminance ?: 0
 
-    def lrOccupied = livingRoomPresence ? (livingRoomPresence.currentValue("mmwave") == "active") : true
+    def lrOccupied = (livingRoomPresence && !isAthomStale()) ? (livingRoomPresence.currentValue("mmwave") == "active") : true
     def lrFull = predawnHueLevel ?: 30
     def lrLevel = lrOccupied ? lrFull : ((lrFull * 50 / 100) as Integer)
     if (lrOccupied) {
@@ -884,6 +982,37 @@ def applyPredawnScene() {
 
     log.info "Predawn scene applied (LR ${lrOccupied ? 'occupied' : 'unoccupied'})"
     safeLogToSheet("scene", "Predawn", "gentle wake", currentLux)
+}
+
+def applyWindDownScene() {
+    state.lastAutomationAction = now()
+    def currentLux = luxSensor?.currentIlluminance ?: 0
+
+    def lrOccupied = (livingRoomPresence && !isAthomStale()) ? (livingRoomPresence.currentValue("mmwave") == "active") : true
+    def lrFull = windDownHueLevel ?: 50
+    def lrLevel = lrOccupied ? lrFull : ((lrFull * 50 / 100) as Integer)
+    if (lrOccupied) {
+        state.lastLrBrightenTime = now()
+    }
+
+    // Ease toward bedtime: dimmer and warmer everywhere - kitchen cans off (not dimmable)
+    diningSwitch?.setLevel(windDownDiningLevel ?: 30)
+    hallwaySwitch?.setLevel(windDownHallwayLevel ?: 40)
+    kitchenCans?.off()
+    kitchenPendant?.setLevel(windDownKitchenPendantLevel ?: 15)
+    bookcaseGOLamp?.setLevel(windDownBookcaseLevel ?: 10)
+    bookcaseColorLamp?.setLevel(windDownBookcaseLevel ?: 10)
+    lrHueLights?.setLevel(lrLevel)
+
+    // Warm color temp for the late evening
+    if (lrHueLights?.hasCommand("setColorTemperature")) {
+        lrHueLights.setColorTemperature(2400)
+    }
+
+    activatorSwitch?.on()
+
+    log.info "Wind-down scene applied (LR ${lrOccupied ? 'occupied' : 'unoccupied'})"
+    safeLogToSheet("scene", "WindDown", "evening ease", currentLux)
 }
 
 def applyTvScene() {

@@ -7,7 +7,7 @@ deployed with `deploy.sh`.
 
 | File | App | Hub instance |
 |------|-----|--------------|
-| GreatRoomLighting.groovy | Great Room Lighting Controller (v1.27) | app:577 |
+| GreatRoomLighting.groovy | Great Room Lighting Controller (v1.30) | app:577 |
 | GreatRoomLightingLogger.gs | Google Apps Script webhook for Sheets logging | (Google) |
 
 ## Workflow
