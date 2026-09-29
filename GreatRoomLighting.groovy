@@ -6,7 +6,7 @@
  *
  *  Author: Claude (for Ashwin)
  *  Date: 2026-02-12
- *  Version: 1.28 - Optimizations: zone dimming touches only LR ceiling, skip redundant all-off, dedupe night logging
+ *  Version: 1.29 - Anti-flap zone dimming (dim delay + bright-hold), predawn gentle-wake scene before 6:15am
  */
 
 definition(
@@ -23,7 +23,7 @@ preferences {
     page(name: "mainPage")
 }
 
-def appVersion() { return "1.28" }
+def appVersion() { return "1.29" }
 
 def mainPage() {
     dynamicPage(name: "mainPage", title: "Great Room Lighting Controller", install: true, uninstall: true) {
@@ -54,6 +54,8 @@ def mainPage() {
             input "cloudyLuxThreshold", "number", title: "Outdoor lux threshold for cloudy check", defaultValue: 400, required: true
             input "presenceTimeout", "number", title: "Minutes before presence times out", defaultValue: 8, required: true
             input "lightsOffDelay", "number", title: "Seconds delay before turning lights off", defaultValue: 10, required: true
+            input "lrDimDelay", "number", title: "Seconds before LR ceiling dims after leaving the room", defaultValue: 60, required: true
+            input "lrBrightHoldMinutes", "number", title: "Minimum minutes LR ceiling stays bright after brightening (anti-flicker)", defaultValue: 3, required: true
         }
         
         section("<b>TV Time</b>") {
@@ -74,6 +76,14 @@ def mainPage() {
             input "nightHueLevel", "number", title: "LR Hue lights brightness", defaultValue: 100
         }
         
+        section("<b>Scene Settings - Predawn (gentle wake)</b>") {
+            input "predawnEnd", "text", title: "Predawn ends at (HH:mm, 24h)", defaultValue: "06:15", required: true
+            input "predawnHallwayLevel", "number", title: "Hallway brightness", defaultValue: 20
+            input "predawnKitchenPendantLevel", "number", title: "Kitchen Pendant brightness", defaultValue: 10
+            input "predawnBookcaseLevel", "number", title: "Bookcase lamps brightness", defaultValue: 10
+            input "predawnHueLevel", "number", title: "LR Hue lights brightness", defaultValue: 30
+        }
+
         section("<b>Scene Settings - TV Time</b>") {
             input "tvBookcaseLevel", "number", title: "Bookcase lamps brightness", defaultValue: 15
             input "tvOtherLightsOff", "bool", title: "Turn off other lights?", defaultValue: true
@@ -192,12 +202,17 @@ def initialize() {
     state.pendingPresenceOff = false
     state.pendingBrightOff = false
     state.turningOff = false
+    state.lastLrBrightenTime = 0
     
     // Set lightNeeded based on current mode and indoor lux
     state.lightNeeded = isLightNeeded()
     
     // Schedule 3am TV Time auto-reset
     schedule("0 0 3 * * ?", resetTvTime)
+
+    // Re-evaluate lighting when the predawn window ends
+    def peParts = (predawnEnd ?: "06:15").split(":")
+    schedule("0 ${peParts[1] as Integer} ${peParts[0] as Integer} * * ?", predawnEnded)
     
     // Auto-disable logging after specified time
     if (logEnable && logEnableMinutes && logEnableMinutes > 0) {
@@ -228,7 +243,7 @@ def delayedInitialEvaluation() {
     if (state.presenceActive && state.lightNeeded && !state.manualOverride && !state.tvTimeActive) {
         log.info "Conditions warrant lights on - applying scene"
         if (location.mode == "Night") {
-            applyNightScene()
+            if (isPredawn()) { applyPredawnScene() } else { applyNightScene() }
         } else {
             applyDayScene()
         }
@@ -310,6 +325,22 @@ def getDiningLevelForAmbient() {
     
     logDebug "Dining ambient level: outdoorLux=${outdoorLux} -> ${level}%"
     return level
+}
+
+def isPredawn() {
+    // True before the configured predawn end time (default 06:15), hub-local time
+    def parts = (predawnEnd ?: "06:15").split(":")
+    def endMins = (parts[0] as Integer) * 60 + (parts[1] as Integer)
+    def cal = java.util.Calendar.getInstance(location.timeZone)
+    def nowMins = cal.get(java.util.Calendar.HOUR_OF_DAY) * 60 + cal.get(java.util.Calendar.MINUTE)
+    return nowMins < endMins
+}
+
+def predawnEnded() {
+    // Predawn window just closed - bring lights up to the normal scene if someone is around
+    if (state.presenceActive && !state.manualOverride && !state.tvTimeActive) {
+        evaluateLighting("predawn window ended")
+    }
 }
 
 def isTruePresenceDetected() {
@@ -589,8 +620,8 @@ def livingRoomPresenceHandler(evt) {
             applyLrZoneLevel(true)
         } else {
             // Delay before dimming to avoid flicker
-            logDebug "LR inactive - will dim in 15 seconds"
-            runIn(15, applyLrDimmed)
+            logDebug "LR inactive - will dim in ${lrDimDelay ?: 60} seconds"
+            runIn(lrDimDelay ?: 60, applyLrDimmed)
         }
     }
 }
@@ -599,19 +630,38 @@ def applyLrDimmed() {
     // Verify still inactive and conditions still apply
     def mmwaveState = livingRoomPresence?.currentValue("mmwave")
     def lightsOn = lrHueLights?.currentSwitch == "on"
-    
-    if (mmwaveState == "inactive" && lightsOn && !state.manualOverride && !state.tvTimeActive) {
-        def currentLux = luxSensor?.currentIlluminance ?: 0
-        safeLogToSheet("zone", "LR inactive", "dimming", currentLux)
-        applyLrZoneLevel(false)
+
+    if (mmwaveState != "inactive" || !lightsOn || state.manualOverride || state.tvTimeActive) {
+        return
     }
+
+    // Anti-flap: never dim inside the bright-hold window; re-check when it expires
+    def holdMs = (lrBrightHoldMinutes ?: 3) * 60 * 1000
+    def sinceBrighten = now() - ((state.lastLrBrightenTime ?: 0) as Long)
+    if (sinceBrighten < holdMs) {
+        def waitSec = (((holdMs - sinceBrighten) / 1000) as Integer) + 1
+        logDebug "LR dim deferred ${waitSec}s (bright-hold active)"
+        runIn(waitSec, applyLrDimmed)
+        return
+    }
+
+    def currentLux = luxSensor?.currentIlluminance ?: 0
+    safeLogToSheet("zone", "LR inactive", "dimming", currentLux)
+    applyLrZoneLevel(false)
 }
 
 def applyLrZoneLevel(Boolean occupied) {
     // Zone dimming touches ONLY the LR ceiling - other lights keep their scene levels
     def isNightish = (location.mode == "Night" || location.mode == "Evening")
-    def fullLevel = isNightish ? (nightHueLevel ?: 100) : (dayHueLevel ?: 100)
-    def lrLevel = occupied ? fullLevel : 50
+    def fullLevel = isNightish ? ((isPredawn() ? (predawnHueLevel ?: 30) : (nightHueLevel ?: 100))) : (dayHueLevel ?: 100)
+    def lrLevel = occupied ? fullLevel : ((fullLevel * 50 / 100) as Integer)
+    if (occupied) {
+        state.lastLrBrightenTime = now()
+    }
+    if (lrHueLights?.currentLevel == lrLevel && lrHueLights?.currentSwitch == "on") {
+        logDebug "LR zone level already ${lrLevel}% - skipping"
+        return
+    }
     state.lastAutomationAction = now()
     lrHueLights?.setLevel(lrLevel)
     logDebug "LR zone level -> ${lrLevel}% (${occupied ? 'occupied' : 'unoccupied'})"
@@ -715,8 +765,13 @@ def evaluateLighting(String reason) {
     
     // Apply scene based on mode
     if (location.mode == "Night") {
-        logDebug "Night mode - applying night scene"
-        applyNightScene()
+        if (isPredawn()) {
+            logDebug "Night mode (predawn) - applying predawn scene"
+            applyPredawnScene()
+        } else {
+            logDebug "Night mode - applying night scene"
+            applyNightScene()
+        }
     } else if (location.mode == "Evening") {
         logDebug "Evening mode - applying night scene"
         applyNightScene()
@@ -798,6 +853,37 @@ def applyNightScene() {
     logDebug "Night scene applied"
     log.info "Night scene applied (LR ${lrOccupied ? 'occupied' : 'unoccupied'}, dining ${diningLevel}%)"
     safeLogToSheet("scene", "Night", "LR ${lrOccupied ? '100%' : '50%'} dining ${diningLevel}%", currentLux)
+}
+
+def applyPredawnScene() {
+    state.lastAutomationAction = now()
+    def currentLux = luxSensor?.currentIlluminance ?: 0
+
+    def lrOccupied = livingRoomPresence ? (livingRoomPresence.currentValue("mmwave") == "active") : true
+    def lrFull = predawnHueLevel ?: 30
+    def lrLevel = lrOccupied ? lrFull : ((lrFull * 50 / 100) as Integer)
+    if (lrOccupied) {
+        state.lastLrBrightenTime = now()
+    }
+
+    // Gentle wake: low warm light only - dining Edisons and kitchen cans stay off
+    diningSwitch?.off()
+    hallwaySwitch?.setLevel(predawnHallwayLevel ?: 20)
+    kitchenCans?.off()
+    kitchenPendant?.setLevel(predawnKitchenPendantLevel ?: 10)
+    bookcaseGOLamp?.setLevel(predawnBookcaseLevel ?: 10)
+    bookcaseColorLamp?.setLevel(predawnBookcaseLevel ?: 10)
+    lrHueLights?.setLevel(lrLevel)
+
+    // Extra warm color temp for early morning
+    if (lrHueLights?.hasCommand("setColorTemperature")) {
+        lrHueLights.setColorTemperature(2200)
+    }
+
+    activatorSwitch?.on()
+
+    log.info "Predawn scene applied (LR ${lrOccupied ? 'occupied' : 'unoccupied'})"
+    safeLogToSheet("scene", "Predawn", "gentle wake", currentLux)
 }
 
 def applyTvScene() {
