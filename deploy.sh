@@ -8,7 +8,7 @@
 #
 # Notes:
 # - APP_CODE_ID is the Apps Code editor id (http://HUB/app/editor/<ID>),
-#   NOT the installed app instance id shown in logs (e.g. app:577).
+#   NOT the installed app instance id shown in logs (e.g. app:584).
 # - After deploying changes that add/remove subscriptions or inputs, open the
 #   app in Apps and click Done to re-initialize.
 
