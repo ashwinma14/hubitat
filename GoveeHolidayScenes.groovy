@@ -15,6 +15,7 @@
  *
  *  Author: Claude (for Ashwin)
  *  Date: 2026-09-29
+ *  Version: 1.2 - game-day "alternate two colors" per-bulb pattern for lights without a DIY scene
  *  Version: 1.1 - verify each send against the driver (effectNum), late +15 min re-send
  *  Version: 1.0 - Halloween window, game-day override, default scene, plug-triggered apply
  */
@@ -35,7 +36,7 @@ preferences {
     page(name: "mainPage")
 }
 
-def appVersion() { return "1.1" }
+def appVersion() { return "1.2" }
 
 def mainPage() {
     dynamicPage(name: "mainPage", title: "Govee Holiday Scenes v${appVersion()}", install: true, uninstall: true) {
@@ -73,7 +74,18 @@ def mainPage() {
         section("<b>Game-day override</b>") {
             input "gameSwitch", "capability.switch", title: "Game-day switch (e.g. Seahawks_Game)", required: false, submitOnChange: true
             if (gameSwitch) {
-                input "gameScene", "text", title: "Scene while the game switch is on", defaultValue: "Seahawks Surge", required: true, submitOnChange: true
+                input "gamePattern", "enum", title: "Game-day look", required: true, defaultValue: "scene", submitOnChange: true,
+                    options: ["scene": "A scene by name (built-in or DIY)", "alternate": "Alternate two colors bulb by bulb (no DIY needed; per-segment lights only)"]
+                if (gamePattern == "alternate") {
+                    paragraph "Bulbs are painted even/odd with the two colors below. The Govee driver cannot confirm segment commands and logs a spurious 'command failed' line for them even when they work, so check the lights."
+                    input "gameColorA", "text", title: "Color A (hex, e.g. #69BE28)", defaultValue: "#69BE28", required: true, width: 4
+                    input "gameColorB", "text", title: "Color B (hex, e.g. #0055FF)", defaultValue: "#0055FF", required: true, width: 4
+                    input "gameBulbCount", "number", title: "Bulbs on the string", defaultValue: 15, required: true, width: 4
+                    input "gameFirstBulb", "number", title: "Index of the first bulb (0 for Govee's API; try 1 if the pattern looks shifted)", defaultValue: 0, required: true
+                    input "gameScene", "text", title: "Fallback scene name for lights without segment control", defaultValue: "Seahawks Surge", required: false, submitOnChange: true
+                } else {
+                    input "gameScene", "text", title: "Scene while the game switch is on", defaultValue: "Seahawks Surge", required: true, submitOnChange: true
+                }
             }
         }
 
@@ -209,6 +221,10 @@ def applyScenes(data) {
     if (appPaused) { logDebug "Paused; not applying"; return }
     String reason = data?.reason ?: "manual"
     def attempt = data?.attempt ?: 1
+    if (gameActive() && gamePattern == "alternate") {
+        applyAlternate(reason, attempt)
+        return
+    }
     String target = targetSceneName()
     def applied = []
     def missing = []
@@ -232,6 +248,58 @@ def applyScenes(data) {
     if (applied) {
         runIn(20, "verifyScenes", [data: [target: target, attempt: attempt], overwrite: true])
     }
+}
+
+/** Game-day two-color pattern: even bulbs get color A, odd bulbs color B, via the driver's per-segment command. Lights without segment control fall back to the game scene by name. */
+def applyAlternate(String reason, attempt) {
+    Map a = hexToColorMap(gameColorA)
+    Map b = hexToColorMap(gameColorB)
+    if (!a || !b) {
+        log.warn "Game-day colors must be hex like #69BE28 (got '${gameColorA}' / '${gameColorB}'); nothing sent"
+        return
+    }
+    int count = Math.max(2, (gameBulbCount ?: 15) as Integer)
+    int first = (gameFirstBulb ?: 0) as Integer
+    def evens = (0..<count).findAll { it % 2 == 0 }.collect { it + first }
+    def odds = (0..<count).findAll { it % 2 == 1 }.collect { it + first }
+    def applied = []
+    def fallback = []
+
+    goveeLights.each { dev ->
+        if (dev.hasCommand("segmentedColorRgb")) {
+            logDebug "${dev.displayName}: segments ${evens} <- ${gameColorA}, ${odds} <- ${gameColorB}"
+            dev.segmentedColorRgb(evens.toString(), a)
+            dev.segmentedColorRgb(odds.toString(), b)
+            applied << dev.displayName
+        } else if (gameScene) {
+            def id = resolveSceneId(dev, gameScene)
+            if (id != null) {
+                dev.setEffect(id)
+                fallback << "${dev.displayName}=${id}"
+            } else {
+                log.warn "${dev.displayName}: no segment control and scene '${gameScene}' not in its catalog; left as is"
+            }
+        }
+    }
+
+    String label = "Alternate ${gameColorA}/${gameColorB}"
+    state.lastApplied = [scene: label, at: now(), reason: reason, attempt: attempt, devices: applied + fallback]
+    state.lastVerify = [scene: label, at: now(), attempt: attempt, confirmed: [], unconfirmed: [], note: "segment commands cannot be confirmed by the driver"]
+    log.info "Game-day pattern ${label} sent (${reason}, attempt ${attempt}): segments on ${applied.join(', ') ?: 'none'}${fallback ? '; scene fallback on ' + fallback.join(', ') : ''}"
+}
+
+/** "#RRGGBB" -> [hue: 0-100, saturation: 0-100, level: 0-100] as the Govee driver's color map expects; null if malformed. */
+Map hexToColorMap(String hex) {
+    String h = hex?.trim()
+    if (!(h ==~ /^#?[0-9A-Fa-f]{6}$/)) return null
+    if (!h.startsWith("#")) h = "#" + h
+    def rgb = hubitat.helper.ColorUtils.hexToRGB(h)
+    def hsv = hubitat.helper.ColorUtils.rgbToHSV(rgb)
+    return [hue: Math.round(hsv[0] as Double) as Integer, saturation: Math.round(hsv[1] as Double) as Integer, level: Math.max(1, Math.round(hsv[2] as Double) as Integer)]
+}
+
+boolean gameActive() {
+    return gameSwitch && gameSwitch.currentValue("switch") == "on"
 }
 
 /** The driver only records effectNum when Govee's cloud accepted the command, so a mismatch means it failed (usually "device offline"). */
@@ -259,7 +327,10 @@ def verifyScenes(data) {
 
 /** The scene that should be showing right now: game override, then the active date window, then the default. */
 String targetSceneName() {
-    if (gameSwitch && gameScene && gameSwitch.currentValue("switch") == "on") return gameScene.trim()
+    if (gameActive()) {
+        if (gamePattern == "alternate") return "Alternate ${gameColorA}/${gameColorB}"
+        if (gameScene) return gameScene.trim()
+    }
     def w = activeWindow()
     return (w ? w.scene : defaultScene)?.trim()
 }
@@ -332,15 +403,22 @@ String statusHtml() {
     sb << "<b>Power</b>: ${power}<br/>"
     goveeLights.each { dev ->
         Map catalog = sceneCatalog(dev)
-        def id = resolveSceneId(dev, target)
         String current = dev.currentValue("effectName") ?: dev.currentValue("effectNum") ?: "?"
-        sb << "<b>${dev.displayName}</b>: '${target}' &rarr; ${id != null ? id : notFound()} "
+        if (gameActive() && gamePattern == "alternate") {
+            sb << "<b>${dev.displayName}</b>: game-day pattern active "
+        } else {
+            def id = resolveSceneId(dev, target)
+            sb << "<b>${dev.displayName}</b>: '${target}' &rarr; ${id != null ? id : notFound()} "
+        }
         sb << "(catalog: ${catalog.size()} scenes; driver reports current effect: ${current})<br/>"
         windows().findAll { it.scene }.each { win ->
             def wid = resolveSceneId(dev, win.scene)
             sb << "&nbsp;&nbsp;${win.name}: '${win.scene}' &rarr; ${wid != null ? wid : notFound()}<br/>"
         }
-        if (gameSwitch && gameScene) {
+        if (gameSwitch && gamePattern == "alternate") {
+            String seg = dev.hasCommand("segmentedColorRgb") ? "per-bulb segments supported" : "NO segment control (falls back to the scene name)"
+            sb << "&nbsp;&nbsp;Game day: alternate ${gameColorA} / ${gameColorB} over ${gameBulbCount ?: 15} bulbs (${seg})<br/>"
+        } else if (gameSwitch && gameScene) {
             def gid = resolveSceneId(dev, gameScene)
             sb << "&nbsp;&nbsp;Game day: '${gameScene}' &rarr; ${gid != null ? gid : notFound()}<br/>"
         }
