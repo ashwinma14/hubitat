@@ -8,6 +8,7 @@ deployed through the hub's MCP Rule Server (`importUrl`), with `deploy.sh` as th
 | File | App | Hub instance |
 |------|-----|--------------|
 | GreatRoomLighting.groovy | Great Room Lighting Controller (v1.30) | app:584 (Apps Code id 529) |
+| GoveeHolidayScenes.groovy | Govee Holiday Scenes (v1.0) — scene-by-date for the Govee string lights | (installed from Apps Code) |
 | GreatRoomLightingLogger.gs | Google Apps Script webhook for Sheets logging | (Google) |
 
 ## Workflow
