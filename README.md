@@ -47,6 +47,18 @@ Hubitat connector:
    source equals the git file's (e.g. from the hub's `/app/ajax/code?id=529`).
 5. If the change touched subscriptions or inputs, open the app and click **Done**.
 
+## Motion Logger (Rule Machine rule 544)
+
+Same shape as the Lux Logger: appends `date,time,device,value` (motion/roomState/mmwave
+values) to `motion.csv`. Fixed the same way on 2026-09-30; raw original kept as
+`motion_raw_backup_20260930.csv` on the hub.
+
+## Archive
+
+`archive/` holds code that used to run on the hub and was retired (kept for reference only):
+`AmbientTierClassifier.groovy` (Apps Code 526, superseded by the adaptive logic in
+Great Room Lighting v1.31).
+
 ## Gotchas
 
 - `APP_CODE_ID` in deploy.conf is the **Apps Code editor id**
