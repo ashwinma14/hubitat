@@ -15,6 +15,7 @@
  *
  *  Author: Claude (for Ashwin)
  *  Date: 2026-09-29
+ *  Version: 1.1 - verify each send against the driver (effectNum), late +15 min re-send
  *  Version: 1.0 - Halloween window, game-day override, default scene, plug-triggered apply
  */
 
@@ -34,7 +35,7 @@ preferences {
     page(name: "mainPage")
 }
 
-def appVersion() { return "1.0" }
+def appVersion() { return "1.1" }
 
 def mainPage() {
     dynamicPage(name: "mainPage", title: "Govee Holiday Scenes v${appVersion()}", install: true, uninstall: true) {
@@ -43,7 +44,7 @@ def mainPage() {
             input "goveeLights", "capability.lightEffects", title: "Govee lights (Govee v2 driver)", multiple: true, required: true, submitOnChange: true
             input "powerSwitches", "capability.switch", title: "Plugs/switches that power these lights", multiple: true, required: true, submitOnChange: true
             input "bootDelay", "number", title: "Seconds after power-on before the first scene command", defaultValue: 45, required: true
-            input "applyAttempts", "number", title: "How many times to send the scene after power-on (1-3; later sends are at +75s and +255s)", defaultValue: 3, required: true
+            input "applyAttempts", "number", title: "How many times to send the scene after power-on (1-4; re-sends at +75s, +255s and +15 min for slow Wi-Fi rejoins)", defaultValue: 4, required: true
         }
 
         section("<b>Scenes</b>") {
@@ -154,8 +155,8 @@ def powerOnHandler(evt) {
     state.powerOnAt = now()
 
     Integer delay = Math.max(5, (bootDelay ?: 45) as Integer)
-    Integer attempts = Math.min(3, Math.max(1, (applyAttempts ?: 3) as Integer))
-    [0, 75, 255].take(attempts).eachWithIndex { offset, i ->
+    Integer attempts = Math.min(4, Math.max(1, (applyAttempts ?: 4) as Integer))
+    [0, 75, 255, 855].take(attempts).eachWithIndex { offset, i ->
         runIn(delay + offset, "applyScenes", [data: [reason: "power-on", attempt: i + 1], overwrite: false])
     }
     logDebug "Scheduled ${attempts} scene send(s) starting in ${delay}s"
@@ -227,6 +228,32 @@ def applyScenes(data) {
     log.info "Scene '${target}' sent (${reason}, attempt ${attempt}): ${applied.join(', ') ?: 'none'}"
     if (missing) {
         log.warn "Scene '${target}' not found in catalog for: ${missing.join(', ')} (use 'Reload scene catalogs', or check the name)"
+    }
+    if (applied) {
+        runIn(20, "verifyScenes", [data: [target: target, attempt: attempt], overwrite: true])
+    }
+}
+
+/** The driver only records effectNum when Govee's cloud accepted the command, so a mismatch means it failed (usually "device offline"). */
+def verifyScenes(data) {
+    String target = data?.target ?: targetSceneName()
+    def confirmed = []
+    def unconfirmed = []
+    goveeLights.each { dev ->
+        def id = resolveSceneId(dev, target)
+        if (id == null) return
+        def current = dev.currentValue("effectNum")
+        if (current?.toString() == id.toString()) {
+            confirmed << dev.displayName
+        } else {
+            unconfirmed << "${dev.displayName} (driver effectNum=${current ?: 'none'})"
+        }
+    }
+    state.lastVerify = [scene: target, at: now(), attempt: data?.attempt, confirmed: confirmed, unconfirmed: unconfirmed]
+    if (unconfirmed) {
+        log.warn "Scene '${target}' NOT confirmed on ${unconfirmed.join(', ')}: Govee's cloud rejected the command, usually 'device offline' (check the light has power and Wi-Fi). Confirmed: ${confirmed ?: 'none'}"
+    } else {
+        log.info "Scene '${target}' confirmed by the driver on ${confirmed.join(', ')}"
     }
 }
 
@@ -320,9 +347,16 @@ String statusHtml() {
     }
     if (state.lastApplied) {
         String when = new Date(state.lastApplied.at as Long).format("yyyy-MM-dd HH:mm:ss", location.timeZone)
-        sb << "<b>Last sent</b>: '${state.lastApplied.scene}' at ${when} (${state.lastApplied.reason}, attempt ${state.lastApplied.attempt})"
+        sb << "<b>Last sent</b>: '${state.lastApplied.scene}' at ${when} (${state.lastApplied.reason}, attempt ${state.lastApplied.attempt})<br/>"
     } else {
-        sb << "<b>Last sent</b>: never"
+        sb << "<b>Last sent</b>: never<br/>"
+    }
+    if (state.lastVerify) {
+        String vwhen = new Date(state.lastVerify.at as Long).format("yyyy-MM-dd HH:mm:ss", location.timeZone)
+        String unconfirmed = state.lastVerify.unconfirmed ? state.lastVerify.unconfirmed.join(', ') : 'none'
+        sb << "<b>Last verification</b> at ${vwhen}: confirmed on ${state.lastVerify.confirmed ?: 'none'}; not confirmed on ${unconfirmed}"
+    } else {
+        sb << "<b>Last verification</b>: none yet"
     }
     return sb.toString()
 }
