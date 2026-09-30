@@ -10,6 +10,16 @@ deployed through the hub's MCP Rule Server (`importUrl`), with `deploy.sh` as th
 | GreatRoomLighting.groovy | Great Room Lighting Controller (v1.31) | app:584 (Apps Code id 529) |
 | GoveeHolidayScenes.groovy | Govee Holiday Scenes (v1.5) — scene-by-date for the Govee string lights | (installed from Apps Code) |
 | GreatRoomLightingLogger.gs | Google Apps Script webhook for Sheets logging | (Google) |
+| tools/LuxCsvRepair.groovy | One-off utility: rebuilt `lux_clean.csv` on 2026-09-30 (used once, then removed from the hub) | none |
+
+## Lux Logger (Rule Machine rule 543)
+
+Appends `date,time,device,value` rows to File Manager `lux_clean.csv` on every
+illuminance change from devices 49 (outdoor), 289, 41, 364. Rule settings that matter:
+`timeFormat=HH:mm:ss`, `dateFormat=yyyy-MM-dd`, and the append content ends with a
+real newline character (RM renders `%nl%` as the text "null" and does not convert `\n`).
+Rows before 2026-09-30 08:18 were rewritten from 12-hour times by `tools/LuxCsvRepair.groovy`;
+the untouched original is `lux_clean_raw_backup_20260930.csv` on the hub.
 
 ## Workflow
 
