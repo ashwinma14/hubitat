@@ -15,6 +15,7 @@
  *
  *  Author: Claude (for Ashwin)
  *  Date: 2026-09-29
+ *  Version: 1.4 - built-in Seahawks 2026 schedule with kickoff windows; calendar switch now optional
  *  Version: 1.3 - per-light segment counts, scene alternatives (A | B), game-day "auto" mode
  *  Version: 1.2 - game-day "alternate two colors" per-bulb pattern for lights without a DIY scene
  *  Version: 1.1 - verify each send against the driver (effectNum), late +15 min re-send
@@ -37,7 +38,7 @@ preferences {
     page(name: "mainPage")
 }
 
-def appVersion() { return "1.3" }
+def appVersion() { return "1.4" }
 
 def mainPage() {
     dynamicPage(name: "mainPage", title: "Govee Holiday Scenes v${appVersion()}", install: true, uninstall: true) {
@@ -76,8 +77,15 @@ def mainPage() {
         }
 
         section("<b>Game-day override</b>") {
-            input "gameSwitch", "capability.switch", title: "Game-day switch (e.g. Seahawks_Game)", required: false, submitOnChange: true
-            if (gameSwitch) {
+            input "scheduleEnabled", "bool", title: "Use the built-in Seahawks 2026 schedule (${gameSchedule().size()} games)", defaultValue: true, submitOnChange: true
+            if (scheduleEnabled) {
+                input "gameLeadMinutes", "number", title: "Start the game look this many minutes before kickoff", defaultValue: 30, required: true, width: 6
+                input "gameHoldMinutes", "number", title: "Keep it this many minutes after kickoff", defaultValue: 240, required: true, width: 6
+                input "extraGames", "textarea", title: "Schedule changes, one per line: 'YYYY-MM-DD HH:mm label' adds or replaces a game (flex moves, playoffs); '-YYYY-MM-DD' removes one", required: false, submitOnChange: true
+                paragraph "Next game: ${nextGameText()}"
+            }
+            input "gameSwitch", "capability.switch", title: "Also treat this switch being on as game time (optional, e.g. a calendar-driven Seahawks_Game switch)", required: false, submitOnChange: true
+            if (gameSwitch || scheduleEnabled) {
                 input "gamePattern", "enum", title: "Game-day look", required: true, defaultValue: "scene", submitOnChange: true,
                     options: ["scene": "A scene by name (built-in or DIY)", "alternate": "Alternate two colors bulb by bulb (no DIY needed; per-segment lights only)", "auto": "The scene where a light has it, the alternate-colors pattern elsewhere"]
                 if (gamePattern in ["alternate", "auto"]) {
@@ -138,6 +146,8 @@ def initialize() {
 
     // Re-evaluate shortly after midnight so a window boundary takes effect while the lights are on
     schedule("0 5 0 * * ?", "dailyRollover")
+    state.gameWindowActive = false
+    scheduleTodaysGame()
 
     if (logEnable && (logEnableMinutes ?: 0) > 0) {
         runIn((logEnableMinutes as Integer) * 60, "logsOff")
@@ -194,6 +204,7 @@ def gameHandler(evt) {
 }
 
 def dailyRollover() {
+    scheduleTodaysGame()
     if (appPaused) return
     if (!anyPowerOn()) { logDebug "Rollover: lights unpowered"; return }
     def target = targetSceneName()
@@ -301,7 +312,113 @@ Map hexToColorMap(String hex) {
 }
 
 boolean gameActive() {
+    if (scheduleEnabled && state.gameWindowActive) return true
     return gameSwitch && gameSwitch.currentValue("switch") == "on"
+}
+
+
+// ==================== GAME SCHEDULE ====================
+
+/** Seahawks 2026 regular season, kickoff in Pacific time (seahawks.com schedule release). Week 18 @ Rams is TBD; the assumed slot below is replaced via 'Schedule changes' once announced. */
+List gameSchedule() {
+    def games = [
+        [date: "2026-09-09", time: "17:20", label: "Wk1 vs Patriots"],
+        [date: "2026-09-20", time: "13:25", label: "Wk2 @ Cardinals"],
+        [date: "2026-09-27", time: "10:00", label: "Wk3 @ Commanders"],
+        [date: "2026-10-04", time: "13:25", label: "Wk4 vs Chargers"],
+        [date: "2026-10-11", time: "13:25", label: "Wk5 vs 49ers"],
+        [date: "2026-10-15", time: "17:15", label: "Wk6 @ Broncos (TNF)"],
+        [date: "2026-10-25", time: "17:20", label: "Wk7 vs Chiefs (SNF)"],
+        [date: "2026-11-02", time: "17:15", label: "Wk8 vs Bears (MNF)"],
+        [date: "2026-11-08", time: "13:25", label: "Wk9 vs Cardinals"],
+        [date: "2026-11-15", time: "13:05", label: "Wk10 @ Raiders"],
+        [date: "2026-11-29", time: "13:25", label: "Wk12 @ 49ers"],
+        [date: "2026-12-07", time: "17:15", label: "Wk13 vs Cowboys (MNF)"],
+        [date: "2026-12-13", time: "13:25", label: "Wk14 vs Giants"],
+        [date: "2026-12-19", time: "14:00", label: "Wk15 @ Eagles (Sat)"],
+        [date: "2026-12-25", time: "17:15", label: "Wk16 vs Rams (Christmas)"],
+        [date: "2027-01-03", time: "10:00", label: "Wk17 @ Panthers"],
+        [date: "2027-01-10", time: "13:25", label: "Wk18 @ Rams (TBD, assumed)"]
+    ]
+    // Overrides from settings: '-YYYY-MM-DD' removes; 'YYYY-MM-DD HH:mm label' adds/replaces that date
+    (extraGames ?: "").split(/\r?\n/).each { String line ->
+        String l = line.trim()
+        if (!l) return
+        if (l.startsWith("-")) {
+            String d = l.substring(1).trim()
+            games.removeAll { it.date == d }
+            return
+        }
+        def m = (l =~ /^(\d{4}-\d{2}-\d{2})\s+(\d{1,2}:\d{2})\s*(.*)$/)
+        if (m.matches()) {
+            games.removeAll { it.date == m.group(1) }
+            games << [date: m.group(1), time: m.group(2), label: m.group(3) ?: "added game"]
+        } else {
+            log.warn "Schedule change line not understood: '${l}'"
+        }
+    }
+    return games.sort { it.date + " " + it.time }
+}
+
+Date gameKickoff(Map g) {
+    def sdf = new java.text.SimpleDateFormat("yyyy-MM-dd H:mm")
+    sdf.setTimeZone(location.timeZone)
+    return sdf.parse("${g.date} ${g.time}")
+}
+
+Map gameWindow(Map g) {
+    long kick = gameKickoff(g).time
+    long lead = ((gameLeadMinutes ?: 30) as Long) * 60000L
+    long hold = ((gameHoldMinutes ?: 240) as Long) * 60000L
+    return [start: new Date(kick - lead), end: new Date(kick + hold), game: g]
+}
+
+/** Arm today's game window (if any): runOnce at its start and end, or start immediately when already inside it. */
+def scheduleTodaysGame() {
+    unschedule("gameWindowStart")
+    unschedule("gameWindowEnd")
+    if (!scheduleEnabled) { state.gameWindowActive = false; return }
+    String today = new Date().format("yyyy-MM-dd", location.timeZone)
+    def g = gameSchedule().find { it.date == today }
+    if (!g) { logDebug "No game today"; return }
+    Map w = gameWindow(g)
+    long t = now()
+    if (t >= w.end.time) { logDebug "Today's game (${g.label}) is over"; return }
+    runOnce(w.end, "gameWindowEnd")
+    if (t >= w.start.time) {
+        gameWindowStart()
+    } else {
+        runOnce(w.start, "gameWindowStart")
+        log.info "Game day: ${g.label} kicks off ${w.game.time}; game look ${w.start.format('HH:mm', location.timeZone)} to ${w.end.format('HH:mm', location.timeZone)}"
+    }
+}
+
+def gameWindowStart() {
+    state.gameWindowActive = true
+    log.info "Game window started"
+    if (appPaused) return
+    if (!anyPowerOn()) { logDebug "Lights unpowered; game look will follow at power-on"; return }
+    runIn(2, "applyScenes", [data: [reason: "game window start", attempt: 1], overwrite: false])
+    runIn(62, "applyScenes", [data: [reason: "game window start", attempt: 2], overwrite: false])
+}
+
+def gameWindowEnd() {
+    state.gameWindowActive = false
+    log.info "Game window ended"
+    if (appPaused) return
+    if (!anyPowerOn()) return
+    runIn(2, "applyScenes", [data: [reason: "game window end", attempt: 1], overwrite: false])
+    runIn(62, "applyScenes", [data: [reason: "game window end", attempt: 2], overwrite: false])
+}
+
+String nextGameText() {
+    long t = now()
+    def upcoming = gameSchedule().find { gameWindow(it).end.time > t }
+    if (!upcoming) return "none left in the table"
+    Map w = gameWindow(upcoming)
+    String when = gameKickoff(upcoming).format("EEE MMM d, h:mm a", location.timeZone)
+    String win = "${w.start.format('h:mm a', location.timeZone)} to ${w.end.format('h:mm a', location.timeZone)}"
+    return "${upcoming.label}, kickoff ${when} (game look ${win})${state.gameWindowActive ? ' - ACTIVE NOW' : ''}"
 }
 
 /** The driver only records effectNum when Govee's cloud accepted the command, so a mismatch means it failed (usually "device offline"). */
@@ -401,9 +518,9 @@ String statusHtml() {
     String today = new Date().format("MM-dd", location.timeZone)
     def w = activeWindow()
     String target = targetSceneName()
-    String gameState = gameSwitch ? gameSwitch.currentValue("switch") : "n/a"
+    String gameState = (gameSwitch ? "switch=" + gameSwitch.currentValue("switch") : "no switch") + (scheduleEnabled ? ", schedule window " + (state.gameWindowActive ? "ACTIVE" : "inactive") : "")
     StringBuilder sb = new StringBuilder()
-    sb << "<b>Today</b> ${today}: window = ${w ? w.name : 'none'}, game switch = ${gameState}, "
+    sb << "<b>Today</b> ${today}: window = ${w ? w.name : 'none'}, game day: ${gameState}, "
     sb << "target scene = <b>${target}</b><br/>"
     String power = powerSwitches ? powerSwitches.collect { it.displayName + '=' + it.currentValue('switch') }.join(', ') : 'none selected'
     sb << "<b>Power</b>: ${power}<br/>"
