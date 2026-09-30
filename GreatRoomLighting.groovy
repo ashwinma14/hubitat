@@ -6,6 +6,8 @@
  *
  *  Author: Claude (for Ashwin)
  *  Date: 2026-02-12
+ *  Version: 1.31 - adaptive brightness: scene levels scale with outdoor lux, fades on every change,
+ *                  sunrise-relative predawn with a morning ramp, kitchen cans only when dark, daytime debounce
  *  Version: 1.30 - Athom staleness guard with dead-sensor alerts, evening wind-down scene
  */
 
@@ -23,7 +25,7 @@ preferences {
     page(name: "mainPage")
 }
 
-def appVersion() { return "1.30" }
+def appVersion() { return "1.31" }
 
 def mainPage() {
     dynamicPage(name: "mainPage", title: "Great Room Lighting Controller", install: true, uninstall: true) {
@@ -70,10 +72,10 @@ def mainPage() {
         }
         
         section("<b>Scene Settings - Night Mode</b>") {
-            input "nightHallwayLevel", "number", title: "Hallway brightness (0-100)", defaultValue: 99
+            input "nightHallwayLevel", "number", title: "Hallway brightness (0-100)", defaultValue: 80
             input "nightKitchenPendantLevel", "number", title: "Kitchen Pendant brightness", defaultValue: 30
             input "nightBookcaseLevel", "number", title: "Bookcase lamps brightness", defaultValue: 15
-            input "nightHueLevel", "number", title: "LR Hue lights brightness", defaultValue: 100
+            input "nightHueLevel", "number", title: "LR Hue lights brightness", defaultValue: 80
         }
         
         section("<b>Scene Settings - Predawn (gentle wake)</b>") {
@@ -98,6 +100,23 @@ def mainPage() {
             input "tvOtherLightsOff", "bool", title: "Turn off other lights?", defaultValue: true
         }
         
+        section("<b>Adaptive Brightness</b>") {
+            paragraph "Scene levels are scaled by outdoor light so the room comes up gradually at dusk and in the morning: 35% of the scene levels while it is still bright outside, then 55%, 75% and 100% as it gets darker. Every change fades."
+            input "adaptiveEnabled", "bool", title: "Enable adaptive brightness", defaultValue: true, submitOnChange: true
+            input "adaptiveLux55", "number", title: "Outdoor lux below which levels run at 55%", defaultValue: 400, required: true, width: 4
+            input "adaptiveLux75", "number", title: "Outdoor lux below which levels run at 75%", defaultValue: 150, required: true, width: 4
+            input "adaptiveLux100", "number", title: "Outdoor lux below which levels run at 100%", defaultValue: 50, required: true, width: 4
+            input "cansLuxThreshold", "number", title: "Kitchen cans only when outdoor lux is below", defaultValue: 150, required: true, width: 6
+            input "ambientStepMinutes", "number", title: "Minimum minutes between ambient steps", defaultValue: 10, required: true, width: 6
+            input "turnOnFadeSeconds", "number", title: "Fade-in when the room turns on (seconds)", defaultValue: 60, required: true, width: 4
+            input "ambientFadeSeconds", "number", title: "Fade for ambient steps (seconds)", defaultValue: 45, required: true, width: 4
+            input "sceneFadeSeconds", "number", title: "Fade for scene changes (seconds)", defaultValue: 3, required: true, width: 4
+            input "predawnSunriseOffset", "number", title: "Predawn lasts until this many minutes before sunrise (or the predawn end time above, whichever is later)", defaultValue: 20, required: true, width: 6
+            input "morningRampMinutes", "number", title: "Minutes to ramp from predawn levels to full once predawn ends", defaultValue: 30, required: true, width: 6
+            input "daytimeOnDebounceMinutes", "number", title: "Daytime with bright outdoors: the dark-room condition must hold this many minutes before the lights turn on", defaultValue: 10, required: true
+            paragraph adaptiveStatus()
+        }
+
         section("<b>Sensor Health</b>") {
             input "athomStaleMinutes", "number", title: "Treat Athom as dead after no events for (minutes)", defaultValue: 30, required: true
             input "notifyDevices", "capability.notification", title: "Notify these devices on sensor failure/recovery", multiple: true, required: false
@@ -224,9 +243,17 @@ def initialize() {
     // Schedule 3am TV Time auto-reset
     schedule("0 0 3 * * ?", resetTvTime)
 
-    // Re-evaluate lighting when the predawn window ends
-    def peParts = (predawnEnd ?: "06:15").split(":")
-    schedule("0 ${peParts[1] as Integer} ${peParts[0] as Integer} * * ?", predawnEnded)
+    // Predawn ends at the later of the configured time and (sunrise - offset); re-armed just after midnight
+    schedule("0 1 0 * * ?", armPredawnEnd)
+    armPredawnEnd()
+
+    // Adaptive brightness bookkeeping
+    state.ambientFactor = rawAmbientFactor()
+    state.ambientChangedAt = now()
+    state.morningRamp = null
+    state.pendingDarkOn = false
+    state.currentScene = state.currentScene ?: "off"
+    runEvery10Minutes(ambientRecheck)
 
     // Re-evaluate lighting when the wind-down window opens
     def wdParts = (windDownStart ?: "21:30").split(":")
@@ -352,18 +379,65 @@ def getDiningLevelForAmbient() {
 }
 
 def isPredawn() {
-    // True before the configured predawn end time (default 06:15), hub-local time
-    def parts = (predawnEnd ?: "06:15").split(":")
-    def endMins = (parts[0] as Integer) * 60 + (parts[1] as Integer)
+    // True before today's predawn end (configured time, or sunrise minus the offset when adaptive brightness is on), hub-local time
     def cal = java.util.Calendar.getInstance(location.timeZone)
     def nowMins = cal.get(java.util.Calendar.HOUR_OF_DAY) * 60 + cal.get(java.util.Calendar.MINUTE)
-    return nowMins < endMins
+    return nowMins < predawnEndMinutes()
+}
+
+Integer predawnEndMinutes() {
+    def parts = (predawnEnd ?: "06:15").split(":")
+    Integer configured = (parts[0] as Integer) * 60 + (parts[1] as Integer)
+    if (adaptiveEnabled == false) return configured
+    try {
+        def cal = java.util.Calendar.getInstance(location.timeZone)
+        cal.setTime(location.sunrise)
+        Integer sunriseMins = cal.get(java.util.Calendar.HOUR_OF_DAY) * 60 + cal.get(java.util.Calendar.MINUTE)
+        return Math.max(configured, sunriseMins - ((predawnSunriseOffset ?: 20) as Integer))
+    } catch (e) {
+        logDebug "Sunrise lookup failed (${e.message}); using configured predawn end"
+        return configured
+    }
+}
+
+def armPredawnEnd() {
+    unschedule("predawnEnded")
+    Integer endMins = predawnEndMinutes()
+    def cal = java.util.Calendar.getInstance(location.timeZone)
+    Integer nowMins = cal.get(java.util.Calendar.HOUR_OF_DAY) * 60 + cal.get(java.util.Calendar.MINUTE)
+    if (nowMins < endMins) {
+        def t = java.util.Calendar.getInstance(location.timeZone)
+        t.set(java.util.Calendar.HOUR_OF_DAY, (endMins / 60) as Integer)
+        t.set(java.util.Calendar.MINUTE, endMins % 60)
+        t.set(java.util.Calendar.SECOND, 0)
+        runOnce(t.getTime(), "predawnEnded")
+        logDebug "Predawn ends today at ${String.format('%02d:%02d', (endMins / 60) as Integer, endMins % 60)}"
+    }
 }
 
 def predawnEnded() {
-    // Predawn window just closed - bring lights up to the normal scene if someone is around
+    // Predawn window just closed - come up gradually (morning ramp) rather than jumping to the full scene
+    if (adaptiveEnabled != false) {
+        state.morningRamp = [start: now(), minutes: (morningRampMinutes ?: 30) as Integer]
+        log.info "Predawn ended - ramping up over ${morningRampMinutes ?: 30} minutes"
+        runIn(180, "morningRampStep")
+    }
     if (state.presenceActive && !state.manualOverride && !state.tvTimeActive) {
         evaluateLighting("predawn window ended")
+    }
+}
+
+def morningRampStep() {
+    if (!state.morningRamp) return
+    Integer rf = rampFactor()
+    if (rf >= 100) {
+        state.morningRamp = null
+        log.info "Morning ramp complete"
+    } else {
+        runIn(180, "morningRampStep")
+    }
+    if (state.presenceActive && state.lightNeeded && !state.manualOverride && !state.tvTimeActive && state.currentScene in ["day", "night"]) {
+        reapplyCurrentScene("morning ramp ${rf}%", (ambientFadeSeconds ?: 45) as Integer)
     }
 }
 
@@ -581,11 +655,26 @@ def indoorLuxHandler(evt) {
                 // Got darker - turn on immediately, cancel any pending off
                 unschedule(turnOffDueToBright)
                 state.pendingBrightOff = false
-                log.info "Indoor lux dropped below ${threshold} - turning on lights"
-                safeLogToSheet("indoorLux", lux.toString(), "below threshold, turning on", lux)
-                evaluateLighting("indoor lux changed to ${lux}")
+                if (daytimeDebounceApplies()) {
+                    // Bright outside, dim inside: make the condition hold before lighting the whole room in daylight
+                    Integer mins = (daytimeOnDebounceMinutes ?: 10) as Integer
+                    if (!state.pendingDarkOn) {
+                        state.pendingDarkOn = true
+                        log.info "Indoor lux ${lux} below ${threshold} in daylight - confirming for ${mins} minutes before turning on"
+                        runIn(mins * 60, "confirmDarkRoom")
+                    }
+                } else {
+                    log.info "Indoor lux dropped below ${threshold} - turning on lights"
+                    safeLogToSheet("indoorLux", lux.toString(), "below threshold, turning on", lux)
+                    evaluateLighting("indoor lux changed to ${lux}")
+                }
             } else {
-                // Got brighter - delay 10 minutes before turning off
+                // Got brighter - cancel a pending daytime turn-on, delay 10 minutes before turning off
+                if (state.pendingDarkOn) {
+                    unschedule("confirmDarkRoom")
+                    state.pendingDarkOn = false
+                    log.info "Indoor lux back above ${threshold} - daytime turn-on cancelled"
+                }
                 if (!state.pendingBrightOff) {
                     log.info "Indoor lux rose above threshold - will turn off in 10 minutes if still bright"
                     safeLogToSheet("indoorLux", lux.toString(), "above threshold, scheduling off", lux)
@@ -644,12 +733,16 @@ def cloudHandler(evt) {
 
 def outdoorLuxHandler(evt) {
     def lux = evt.value.toInteger()
+
+    if (adaptiveEnabled != false) {
+        // Adaptive: a band change re-applies the whole scene (dining included) with a slow fade
+        ambientStep("outdoor lux ${lux}")
+        return
+    }
     
-    // Track last dining level to avoid unnecessary updates
+    // Legacy path: only the dining level follows outdoor light
     def newDiningLevel = getDiningLevelForAmbient()
     def lastDiningLevel = state.lastDiningLevel ?: 100
-    
-    // Only update if level changed and lights are on
     if (newDiningLevel != lastDiningLevel && state.presenceActive && state.lightNeeded && !state.manualOverride && !state.tvTimeActive) {
         state.lastDiningLevel = newDiningLevel
         log.info "Outdoor lux ${lux} -> dining level ${newDiningLevel}%"
@@ -743,8 +836,8 @@ def applyLrDimmed() {
 def applyLrZoneLevel(Boolean occupied) {
     // Zone dimming touches ONLY the LR ceiling - other lights keep their scene levels
     def isNightish = (location.mode == "Night" || location.mode == "Evening")
-    def fullLevel = isNightish ? (isPredawn() ? (predawnHueLevel ?: 30) : (isWindDown() ? (windDownHueLevel ?: 50) : (nightHueLevel ?: 100))) : (dayHueLevel ?: 100)
-    def lrLevel = occupied ? fullLevel : ((fullLevel * 50 / 100) as Integer)
+    def fullLevel = isNightish ? (isPredawn() ? (predawnHueLevel ?: 30) : (isWindDown() ? (windDownHueLevel ?: 50) : (nightHueLevel ?: 80))) : (dayHueLevel ?: 100)
+    def lrLevel = scaled(occupied ? fullLevel : ((fullLevel * 50 / 100) as Integer))
     if (occupied) {
         state.lastLrBrightenTime = now()
     }
@@ -753,7 +846,7 @@ def applyLrZoneLevel(Boolean occupied) {
         return
     }
     state.lastAutomationAction = now()
-    lrHueLights?.setLevel(lrLevel)
+    setLevelSmooth(lrHueLights, lrLevel, 5)
     logDebug "LR zone level -> ${lrLevel}% (${occupied ? 'occupied' : 'unoccupied'})"
 }
 
@@ -770,6 +863,11 @@ def modeHandler(evt) {
     
     logDebug "Mode changed: lightNeeded was ${wasNeeded}, now ${state.lightNeeded}"
     
+    if (evt.value in ["Evening", "Night"] && state.pendingDarkOn) {
+        unschedule("confirmDarkRoom")
+        state.pendingDarkOn = false
+    }
+
     // Always re-evaluate when mode changes (this is now our primary trigger)
     if (wasNeeded != state.lightNeeded || state.presenceActive) {
         evaluateLighting("mode changed to ${evt.value}")
@@ -850,6 +948,12 @@ def evaluateLighting(String reason) {
         return
     }
     
+    // Daytime debounce pending (bright outside, dim inside): keep waiting unless the room is already on
+    if (state.pendingDarkOn && !roomIsOn()) {
+        logDebug "Dark-room debounce pending - not turning on yet"
+        return
+    }
+
     // We need lights - cancel any pending off
     unschedule(turnAllLightsOff)
     
@@ -879,67 +983,197 @@ def evaluateLighting(String reason) {
     }
 }
 
-// ==================== SCENE ACTIONS ====================
+// ==================== ADAPTIVE BRIGHTNESS ====================
 
-def applyDayScene() {
-    state.lastAutomationAction = now()
-    def currentLux = luxSensor?.currentIlluminance ?: 0
-    
-    // Check if living room is occupied (default to true if sensor not configured)
-    def lrOccupied = (livingRoomPresence && !isAthomStale()) ? (livingRoomPresence.currentValue("mmwave") == "active") : true
-    def lrLevel = lrOccupied ? (dayHueLevel ?: 100) : 50
-    
-    // Get ambient-based dining level
-    def diningLevel = getDiningLevelForAmbient()
-    
-    logDebug "Day scene: LR occupied=${lrOccupied}, lrLevel=${lrLevel}, diningLevel=${diningLevel}"
-    
-    // Kitchen/Hallway zone
-    diningSwitch?.setLevel(diningLevel)
-    hallwaySwitch?.setLevel(dayHallwayLevel ?: 99)
-    kitchenCans?.on()
-    kitchenPendant?.setLevel(dayKitchenPendantLevel ?: 100)
-    
-    // Living Room zone - only ceiling dims when unoccupied, bookcase stays constant
-    bookcaseGOLamp?.setLevel(dayBookcaseLevel ?: 50)
-    bookcaseColorLamp?.setLevel(dayBookcaseLevel ?: 50)
-    lrHueLights?.setLevel(lrLevel)
-    
-    // Set color temp if supported (warm white)
-    if (lrHueLights?.hasCommand("setColorTemperature")) {
-        lrHueLights.setColorTemperature(2700)
-    }
-    
-    activatorSwitch?.on()
-    
-    logDebug "Day scene applied"
-    log.info "Day scene applied (LR ${lrOccupied ? 'occupied' : 'unoccupied'}, dining ${diningLevel}%)"
-    safeLogToSheet("scene", "Day", "LR ${lrOccupied ? '100%' : '50%'} dining ${diningLevel}%", currentLux)
+/** Which scene-level band the outdoor light calls for: 35 / 55 / 75 / 100 percent of the scene's base levels. scale widens the edges for hysteresis. */
+Integer bandFactor(Number lux, BigDecimal scale) {
+    BigDecimal l55 = ((adaptiveLux55 ?: 400) as BigDecimal) * scale
+    BigDecimal l75 = ((adaptiveLux75 ?: 150) as BigDecimal) * scale
+    BigDecimal l100 = ((adaptiveLux100 ?: 50) as BigDecimal) * scale
+    BigDecimal l = lux as BigDecimal
+    if (l < l100) return 100
+    if (l < l75) return 75
+    if (l < l55) return 55
+    return 35
 }
 
-def applyNightScene() {
+/** The band for the current outdoor reading, no hysteresis or rate limit (used when the room turns on and for status). */
+Integer rawAmbientFactor() {
+    if (adaptiveEnabled == false) return 100
+    def lux = outdoorLuxSensor?.currentIlluminance
+    if (lux == null) return 100
+    return bandFactor(lux, 1.0)
+}
+
+/**
+ * Ambient factor with hysteresis and a rate limit, committed to state.
+ * Darker outside: step up as soon as the reading crosses an edge. Brighter outside: step down only once the
+ * reading is 40% past the edge, so dusk never flickers. At most one step per ambientStepMinutes.
+ */
+Integer ambientFactor(boolean commit = true) {
+    if (adaptiveEnabled == false) return 100
+    def lux = outdoorLuxSensor?.currentIlluminance
+    if (lux == null) return 100
+    Integer last = (state.ambientFactor ?: rawAmbientFactor()) as Integer
+    Integer up = bandFactor(lux, 1.0)
+    Integer down = bandFactor(lux, 1.4)
+    Integer target = last
+    if (up > last) target = up
+    else if (down < last) target = down
+    if (target == last || !commit) return commit ? last : target
+    long since = now() - ((state.ambientChangedAt ?: 0) as Long)
+    long minMs = ((ambientStepMinutes ?: 10) as Long) * 60000L
+    if (since < minMs) {
+        runIn((((minMs - since) / 1000) as Integer) + 1, "ambientRecheck")
+        return last
+    }
+    state.ambientFactor = target
+    state.ambientChangedAt = now()
+    log.info "Ambient factor ${last}% -> ${target}% (outdoor ${lux} lux)"
+    return target
+}
+
+/** Morning ramp: 30% of scene levels when predawn ends, rising to 100% over morningRampMinutes. 100 when no ramp is running. */
+Integer rampFactor() {
+    if (!state.morningRamp) return 100
+    long elapsed = now() - ((state.morningRamp.start ?: 0) as Long)
+    Integer mins = (state.morningRamp.minutes ?: 30) as Integer
+    if (mins <= 0) return 100
+    return Math.min(100, (30 + (70 * elapsed / (mins * 60000L))) as Integer)
+}
+
+Integer effectiveFactor() {
+    return Math.min(ambientFactor(), rampFactor())
+}
+
+/** Scale a scene level by the effective factor, never below 10% (or the level itself when lower) and never above 100. */
+Integer scaled(Number base) {
+    Integer b = (base ?: 0) as Integer
+    if (b <= 0) return 0
+    Integer v = Math.round(((b * effectiveFactor()) / 100.0d) as double) as Integer
+    return Math.min(100, Math.max(Math.min(10, b), v))
+}
+
+boolean cansWanted() {
+    if (adaptiveEnabled == false) return true
+    def lux = outdoorLuxSensor?.currentIlluminance
+    if (lux == null) return true
+    return lux < (cansLuxThreshold ?: 150)
+}
+
+def setCans(boolean on) {
+    if (!kitchenCans) return
+    if (on && kitchenCans.currentSwitch != "on") kitchenCans.on()
+    else if (!on && kitchenCans.currentSwitch != "off") kitchenCans.off()
+}
+
+boolean roomIsOn() {
+    return [hallwaySwitch, kitchenPendant, lrHueLights, diningSwitch].any { it?.currentSwitch == "on" }
+}
+
+/** Fade for a scene application: long fade-in when the room was off, short when changing an already-lit room. */
+Integer sceneFade(Number override) {
+    if (override != null) return override as Integer
+    if (!roomIsOn()) {
+        // Fresh turn-on: start from the current outdoor reading, not a factor left over from last night
+        state.ambientFactor = rawAmbientFactor()
+        state.ambientChangedAt = now()
+        return (turnOnFadeSeconds ?: 60) as Integer
+    }
+    return (sceneFadeSeconds ?: 3) as Integer
+}
+
+/** setLevel with a transition where the driver takes one (all the dimmers and Hue devices here do). */
+def setLevelSmooth(dev, Number level, Number seconds) {
+    if (!dev) return
+    Integer lvl = Math.max(0, Math.min(100, (level ?: 0) as Integer))
+    Integer sec = Math.max(0, (seconds ?: 0) as Integer)
+    try {
+        dev.setLevel(lvl, sec)
+    } catch (e) {
+        logDebug "${dev.displayName}: setLevel with duration failed (${e.message}); plain setLevel"
+        dev.setLevel(lvl)
+    }
+}
+
+/** Re-apply the current day/night scene when the ambient band changes while the room is on. */
+def ambientStep(String reason) {
+    if (adaptiveEnabled == false || appPaused) return
+    if (!(state.presenceActive && state.lightNeeded && !state.manualOverride && !state.tvTimeActive)) return
+    if (!(state.currentScene in ["day", "night"]) || !roomIsOn()) return
+    Integer before = (state.ambientFactor ?: 100) as Integer
+    Integer after = ambientFactor()
+    if (after == before) return
+    reapplyCurrentScene("ambient ${reason}", (ambientFadeSeconds ?: 45) as Integer)
+}
+
+def ambientRecheck() {
+    ambientStep("recheck")
+}
+
+def reapplyCurrentScene(String reason, Integer fade) {
+    logDebug "Re-applying ${state.currentScene} scene (${reason}, fade ${fade}s)"
+    if (state.currentScene == "day") applyDayScene(fade)
+    else if (state.currentScene == "night") applyNightScene(fade)
+}
+
+boolean daytimeDebounceApplies() {
+    if (adaptiveEnabled == false) return false
+    if (location.mode in ["Evening", "Night"]) return false
+    if (((daytimeOnDebounceMinutes ?: 10) as Integer) <= 0) return false
+    def lux = outdoorLuxSensor?.currentIlluminance
+    return lux != null && lux >= (adaptiveLux55 ?: 400)
+}
+
+def confirmDarkRoom() {
+    state.pendingDarkOn = false
+    state.lightNeeded = isLightNeeded()
+    if (state.lightNeeded && state.presenceActive && !state.manualOverride && !state.tvTimeActive) {
+        log.info "Dark room held for ${daytimeOnDebounceMinutes ?: 10} minutes - turning on lights"
+        evaluateLighting("dark room confirmed")
+    } else {
+        log.info "Dark-room condition cleared before the debounce ended - not turning on"
+    }
+}
+
+String adaptiveStatus() {
+    def lux = outdoorLuxSensor?.currentIlluminance
+    Integer endMins = predawnEndMinutes()
+    String predawnAt = String.format('%02d:%02d', (endMins / 60) as Integer, endMins % 60)
+    String ramp = state.morningRamp ? "morning ramp at ${rampFactor()}%" : "no morning ramp running"
+    return "Outdoor ${lux != null ? lux + ' lux' : 'sensor missing'}: band ${rawAmbientFactor()}%, applied factor ${state.ambientFactor ?: '-'}%; " +
+           "${ramp}; predawn ends ${predawnAt} today; scene now: ${state.currentScene ?: 'off'}; " +
+           "cans ${cansWanted() ? 'allowed' : 'held off'} (threshold ${cansLuxThreshold ?: 150} lux)"
+}
+
+// ==================== SCENE ACTIONS ====================
+
+def applyDayScene(Number fadeOverride = null) {
     state.lastAutomationAction = now()
     def currentLux = luxSensor?.currentIlluminance ?: 0
+    Integer fade = sceneFade(fadeOverride)
+    Integer factor = effectiveFactor()
     
     // Check if living room is occupied (default to true if sensor not configured)
     def lrOccupied = (livingRoomPresence && !isAthomStale()) ? (livingRoomPresence.currentValue("mmwave") == "active") : true
-    def lrLevel = lrOccupied ? (nightHueLevel ?: 100) : 50
+    def lrLevel = scaled(lrOccupied ? (dayHueLevel ?: 100) : 50)
     
-    // Get ambient-based dining level (will be 100% at night since outdoor lux is low)
-    def diningLevel = getDiningLevelForAmbient()
+    // Dining Edisons: two-step base (100% once dark outside, else 50%), scaled by the factor, never below 50%
+    def diningLevel = Math.max(50, scaled(getDiningLevelForAmbient()))
+    boolean cansOn = cansWanted()
     
-    logDebug "Night scene: LR occupied=${lrOccupied}, lrLevel=${lrLevel}, diningLevel=${diningLevel}"
+    logDebug "Day scene: factor=${factor}%, fade=${fade}s, LR occupied=${lrOccupied}, lrLevel=${lrLevel}, diningLevel=${diningLevel}, cans=${cansOn}"
     
     // Kitchen/Hallway zone
-    diningSwitch?.setLevel(diningLevel)
-    hallwaySwitch?.setLevel(nightHallwayLevel ?: 99)
-    kitchenCans?.on()
-    kitchenPendant?.setLevel(nightKitchenPendantLevel ?: 30)
+    setLevelSmooth(diningSwitch, diningLevel, fade)
+    setLevelSmooth(hallwaySwitch, scaled(dayHallwayLevel ?: 99), fade)
+    setCans(cansOn)
+    setLevelSmooth(kitchenPendant, scaled(dayKitchenPendantLevel ?: 100), fade)
     
     // Living Room zone - only ceiling dims when unoccupied, bookcase stays constant
-    bookcaseGOLamp?.setLevel(nightBookcaseLevel ?: 15)
-    bookcaseColorLamp?.setLevel(nightBookcaseLevel ?: 15)
-    lrHueLights?.setLevel(lrLevel)
+    setLevelSmooth(bookcaseGOLamp, scaled(dayBookcaseLevel ?: 50), fade)
+    setLevelSmooth(bookcaseColorLamp, scaled(dayBookcaseLevel ?: 50), fade)
+    setLevelSmooth(lrHueLights, lrLevel, fade)
     
     // Set color temp if supported (warm white)
     if (lrHueLights?.hasCommand("setColorTemperature")) {
@@ -947,10 +1181,50 @@ def applyNightScene() {
     }
     
     activatorSwitch?.on()
+    state.currentScene = "day"
     
-    logDebug "Night scene applied"
-    log.info "Night scene applied (LR ${lrOccupied ? 'occupied' : 'unoccupied'}, dining ${diningLevel}%)"
-    safeLogToSheet("scene", "Night", "LR ${lrOccupied ? '100%' : '50%'} dining ${diningLevel}%", currentLux)
+    log.info "Day scene applied (factor ${factor}%, fade ${fade}s, LR ${lrOccupied ? 'occupied' : 'unoccupied'} ${lrLevel}%, dining ${diningLevel}%, cans ${cansOn ? 'on' : 'off'})"
+    safeLogToSheet("scene", "Day", "factor ${factor}% LR ${lrLevel}% dining ${diningLevel}%", currentLux)
+}
+
+def applyNightScene(Number fadeOverride = null) {
+    state.lastAutomationAction = now()
+    def currentLux = luxSensor?.currentIlluminance ?: 0
+    Integer fade = sceneFade(fadeOverride)
+    Integer factor = effectiveFactor()
+    
+    // Check if living room is occupied (default to true if sensor not configured)
+    def lrOccupied = (livingRoomPresence && !isAthomStale()) ? (livingRoomPresence.currentValue("mmwave") == "active") : true
+    def lrFull = nightHueLevel ?: 80
+    def lrLevel = scaled(lrOccupied ? lrFull : ((lrFull * 50 / 100) as Integer))
+    
+    // Dining Edisons: two-step base (100% once dark outside, else 50%), scaled by the factor, never below 50%
+    def diningLevel = Math.max(50, scaled(getDiningLevelForAmbient()))
+    boolean cansOn = cansWanted()
+    
+    logDebug "Night scene: factor=${factor}%, fade=${fade}s, LR occupied=${lrOccupied}, lrLevel=${lrLevel}, diningLevel=${diningLevel}, cans=${cansOn}"
+    
+    // Kitchen/Hallway zone
+    setLevelSmooth(diningSwitch, diningLevel, fade)
+    setLevelSmooth(hallwaySwitch, scaled(nightHallwayLevel ?: 80), fade)
+    setCans(cansOn)
+    setLevelSmooth(kitchenPendant, scaled(nightKitchenPendantLevel ?: 30), fade)
+    
+    // Living Room zone - only ceiling dims when unoccupied, bookcase stays constant
+    setLevelSmooth(bookcaseGOLamp, scaled(nightBookcaseLevel ?: 15), fade)
+    setLevelSmooth(bookcaseColorLamp, scaled(nightBookcaseLevel ?: 15), fade)
+    setLevelSmooth(lrHueLights, lrLevel, fade)
+    
+    // Set color temp if supported (warm white)
+    if (lrHueLights?.hasCommand("setColorTemperature")) {
+        lrHueLights.setColorTemperature(2700)
+    }
+    
+    activatorSwitch?.on()
+    state.currentScene = "night"
+    
+    log.info "Night scene applied (factor ${factor}%, fade ${fade}s, LR ${lrOccupied ? 'occupied' : 'unoccupied'} ${lrLevel}%, dining ${diningLevel}%, cans ${cansOn ? 'on' : 'off'})"
+    safeLogToSheet("scene", "Night", "factor ${factor}% LR ${lrLevel}% dining ${diningLevel}%", currentLux)
 }
 
 def applyPredawnScene() {
@@ -965,13 +1239,15 @@ def applyPredawnScene() {
     }
 
     // Gentle wake: low warm light only - dining Edisons and kitchen cans stay off
+    Integer fade = sceneFade(null)
     diningSwitch?.off()
-    hallwaySwitch?.setLevel(predawnHallwayLevel ?: 20)
-    kitchenCans?.off()
-    kitchenPendant?.setLevel(predawnKitchenPendantLevel ?: 10)
-    bookcaseGOLamp?.setLevel(predawnBookcaseLevel ?: 10)
-    bookcaseColorLamp?.setLevel(predawnBookcaseLevel ?: 10)
-    lrHueLights?.setLevel(lrLevel)
+    setLevelSmooth(hallwaySwitch, predawnHallwayLevel ?: 20, fade)
+    setCans(false)
+    setLevelSmooth(kitchenPendant, predawnKitchenPendantLevel ?: 10, fade)
+    setLevelSmooth(bookcaseGOLamp, predawnBookcaseLevel ?: 10, fade)
+    setLevelSmooth(bookcaseColorLamp, predawnBookcaseLevel ?: 10, fade)
+    setLevelSmooth(lrHueLights, lrLevel, fade)
+    state.currentScene = "predawn"
 
     // Extra warm color temp for early morning
     if (lrHueLights?.hasCommand("setColorTemperature")) {
@@ -995,14 +1271,16 @@ def applyWindDownScene() {
         state.lastLrBrightenTime = now()
     }
 
-    // Ease toward bedtime: dimmer and warmer everywhere - kitchen cans off (not dimmable)
-    diningSwitch?.setLevel(windDownDiningLevel ?: 30)
-    hallwaySwitch?.setLevel(windDownHallwayLevel ?: 40)
-    kitchenCans?.off()
-    kitchenPendant?.setLevel(windDownKitchenPendantLevel ?: 15)
-    bookcaseGOLamp?.setLevel(windDownBookcaseLevel ?: 10)
-    bookcaseColorLamp?.setLevel(windDownBookcaseLevel ?: 10)
-    lrHueLights?.setLevel(lrLevel)
+    // Ease toward bedtime: dimmer and warmer everywhere, over 30 s - kitchen cans off (not dimmable)
+    Integer fade = roomIsOn() ? 30 : sceneFade(null)
+    setLevelSmooth(diningSwitch, windDownDiningLevel ?: 30, fade)
+    setLevelSmooth(hallwaySwitch, windDownHallwayLevel ?: 40, fade)
+    setCans(false)
+    setLevelSmooth(kitchenPendant, windDownKitchenPendantLevel ?: 15, fade)
+    setLevelSmooth(bookcaseGOLamp, windDownBookcaseLevel ?: 10, fade)
+    setLevelSmooth(bookcaseColorLamp, windDownBookcaseLevel ?: 10, fade)
+    setLevelSmooth(lrHueLights, lrLevel, fade)
+    state.currentScene = "winddown"
 
     // Warm color temp for the late evening
     if (lrHueLights?.hasCommand("setColorTemperature")) {
@@ -1037,6 +1315,7 @@ def applyTvScene() {
     }
     
     activatorSwitch?.off()
+    state.currentScene = "tv"
     
     logDebug "TV Time scene applied"
     log.info "TV Time scene applied"
@@ -1066,6 +1345,7 @@ def turnAllLightsOff() {
     
     // Clear the turningOff flag after a delay
     runIn(3, clearTurningOffFlag)
+    state.currentScene = "off"
     
     log.info "All lights turned off"
     safeLogToSheet("scene", "Off", "all lights off", currentLux)
