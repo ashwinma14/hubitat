@@ -15,6 +15,7 @@
  *
  *  Author: Claude (for Ashwin)
  *  Date: 2026-09-29
+ *  Version: 1.5 - game night lasts until the lights go off in the morning (all-night mode, default on)
  *  Version: 1.4 - built-in Seahawks 2026 schedule with kickoff windows; calendar switch now optional
  *  Version: 1.3 - per-light segment counts, scene alternatives (A | B), game-day "auto" mode
  *  Version: 1.2 - game-day "alternate two colors" per-bulb pattern for lights without a DIY scene
@@ -38,7 +39,7 @@ preferences {
     page(name: "mainPage")
 }
 
-def appVersion() { return "1.4" }
+def appVersion() { return "1.5" }
 
 def mainPage() {
     dynamicPage(name: "mainPage", title: "Govee Holiday Scenes v${appVersion()}", install: true, uninstall: true) {
@@ -79,8 +80,9 @@ def mainPage() {
         section("<b>Game-day override</b>") {
             input "scheduleEnabled", "bool", title: "Use the built-in Seahawks 2026 schedule (${gameSchedule().size()} games)", defaultValue: true, submitOnChange: true
             if (scheduleEnabled) {
+                input "gameAllNight", "bool", title: "Keep the game look until the lights go off for the night (otherwise it ends a fixed time after kickoff)", defaultValue: true, submitOnChange: true
                 input "gameLeadMinutes", "number", title: "Start the game look this many minutes before kickoff", defaultValue: 30, required: true, width: 6
-                input "gameHoldMinutes", "number", title: "Keep it this many minutes after kickoff", defaultValue: 240, required: true, width: 6
+                input "gameHoldMinutes", "number", title: gameAllNight == false ? "End it this many minutes after kickoff" : "Earliest a power-off may end game night (minutes after kickoff)", defaultValue: 240, required: true, width: 6
                 input "extraGames", "textarea", title: "Schedule changes, one per line: 'YYYY-MM-DD HH:mm label' adds or replaces a game (flex moves, playoffs); '-YYYY-MM-DD' removes one", required: false, submitOnChange: true
                 paragraph "Next game: ${nextGameText()}"
             }
@@ -192,6 +194,9 @@ def powerOffHandler(evt) {
     if (!anyPowerOn()) {
         unschedule("applyScenes")
         logDebug "All power switches off; cancelled pending scene sends"
+        if (state.gameWindowActive && gameAllNight != false && now() >= ((state.gameMinEnd ?: 0) as Long)) {
+            endGameWindow(false)
+        }
     }
 }
 
@@ -366,47 +371,80 @@ Date gameKickoff(Map g) {
     return sdf.parse("${g.date} ${g.time}")
 }
 
+/** start = kickoff - lead. minEnd = kickoff + hold (earliest a power-off may end the night). end = hard end: 10:00 the next morning in all-night mode, else minEnd. */
 Map gameWindow(Map g) {
     long kick = gameKickoff(g).time
     long lead = ((gameLeadMinutes ?: 30) as Long) * 60000L
     long hold = ((gameHoldMinutes ?: 240) as Long) * 60000L
-    return [start: new Date(kick - lead), end: new Date(kick + hold), game: g]
+    Date minEnd = new Date(kick + hold)
+    Date hardEnd = minEnd
+    if (gameAllNight != false) {
+        def sdf = new java.text.SimpleDateFormat("yyyy-MM-dd HH:mm")
+        sdf.setTimeZone(location.timeZone)
+        hardEnd = new Date(sdf.parse("${g.date} 10:00").time + 86400000L)
+    }
+    return [start: new Date(kick - lead), minEnd: minEnd, end: hardEnd, game: g]
 }
 
-/** Arm today's game window (if any): runOnce at its start and end, or start immediately when already inside it. */
+/** Arm the game window: today's game, or yesterday's when its night is still running. Called at init and at the 00:05 rollover. */
 def scheduleTodaysGame() {
     unschedule("gameWindowStart")
-    unschedule("gameWindowEnd")
-    if (!scheduleEnabled) { state.gameWindowActive = false; return }
-    String today = new Date().format("yyyy-MM-dd", location.timeZone)
-    def g = gameSchedule().find { it.date == today }
-    if (!g) { logDebug "No game today"; return }
-    Map w = gameWindow(g)
+    if (!scheduleEnabled) { if (state.gameWindowActive) endGameWindow(true); return }
     long t = now()
-    if (t >= w.end.time) { logDebug "Today's game (${g.label}) is over"; return }
-    runOnce(w.end, "gameWindowEnd")
-    if (t >= w.start.time) {
-        gameWindowStart()
+    String today = new Date(t).format("yyyy-MM-dd", location.timeZone)
+    String yesterday = new Date(t - 86400000L).format("yyyy-MM-dd", location.timeZone)
+    def windows = gameSchedule().findAll { it.date == today || it.date == yesterday }.collect { gameWindow(it) }
+    Map active = windows.find { t >= it.start.time && t < it.end.time }
+    if (active) {
+        unschedule("gameWindowEnd")
+        runOnce(active.end, "gameWindowEnd")
+        state.gameMinEnd = active.minEnd.time
+        state.gameLabel = active.game.label
+        if (!state.gameWindowActive) gameWindowStart()
+        return
+    }
+    if (state.gameWindowActive) endGameWindow(true)
+    Map upcoming = windows.find { t < it.start.time }
+    if (upcoming) {
+        runOnce(upcoming.start, "gameWindowStart")
+        state.gameMinEnd = upcoming.minEnd.time
+        state.gameLabel = upcoming.game.label
+        log.info "Game day: ${upcoming.game.label} kicks off ${upcoming.game.time}; game look from ${upcoming.start.format('HH:mm', location.timeZone)}" +
+                 (gameAllNight != false ? " until the lights go off for the night" : " to ${upcoming.end.format('HH:mm', location.timeZone)}")
     } else {
-        runOnce(w.start, "gameWindowStart")
-        log.info "Game day: ${g.label} kicks off ${w.game.time}; game look ${w.start.format('HH:mm', location.timeZone)} to ${w.end.format('HH:mm', location.timeZone)}"
+        logDebug "No game today"
     }
 }
 
 def gameWindowStart() {
     state.gameWindowActive = true
-    log.info "Game window started"
+    String today = new Date().format("yyyy-MM-dd", location.timeZone)
+    def g = gameSchedule().find { it.date == today }
+    if (g) {
+        Map w = gameWindow(g)
+        state.gameMinEnd = w.minEnd.time
+        state.gameLabel = g.label
+        unschedule("gameWindowEnd")
+        runOnce(w.end, "gameWindowEnd")
+    }
+    log.info "Game window started (${state.gameLabel ?: 'game'})"
     if (appPaused) return
     if (!anyPowerOn()) { logDebug "Lights unpowered; game look will follow at power-on"; return }
     runIn(2, "applyScenes", [data: [reason: "game window start", attempt: 1], overwrite: false])
     runIn(62, "applyScenes", [data: [reason: "game window start", attempt: 2], overwrite: false])
 }
 
+/** Hard end (next morning 10:00 in all-night mode, or kickoff + hold otherwise). */
 def gameWindowEnd() {
+    endGameWindow(true)
+}
+
+def endGameWindow(boolean reapply) {
+    if (!state.gameWindowActive) return
     state.gameWindowActive = false
-    log.info "Game window ended"
-    if (appPaused) return
-    if (!anyPowerOn()) return
+    unschedule("gameWindowEnd")
+    log.info "Game window ended (${state.gameLabel ?: 'game'})"
+    if (!reapply || appPaused || !anyPowerOn()) return
     runIn(2, "applyScenes", [data: [reason: "game window end", attempt: 1], overwrite: false])
     runIn(62, "applyScenes", [data: [reason: "game window end", attempt: 2], overwrite: false])
 }
@@ -417,7 +455,7 @@ String nextGameText() {
     if (!upcoming) return "none left in the table"
     Map w = gameWindow(upcoming)
     String when = gameKickoff(upcoming).format("EEE MMM d, h:mm a", location.timeZone)
-    String win = "${w.start.format('h:mm a', location.timeZone)} to ${w.end.format('h:mm a', location.timeZone)}"
+    String win = gameAllNight != false ? "from ${w.start.format('h:mm a', location.timeZone)} until the lights go off that night" : "${w.start.format('h:mm a', location.timeZone)} to ${w.end.format('h:mm a', location.timeZone)}"
     return "${upcoming.label}, kickoff ${when} (game look ${win})${state.gameWindowActive ? ' - ACTIVE NOW' : ''}"
 }
 
