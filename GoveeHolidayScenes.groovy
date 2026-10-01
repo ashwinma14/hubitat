@@ -15,6 +15,7 @@
  *
  *  Author: Claude (for Ashwin)
  *  Date: 2026-09-29
+ *  Version: 1.6 - single-threaded: two plugs reporting "on" in the same second no longer schedule a second set of re-sends
  *  Version: 1.5 - game night lasts until the lights go off in the morning (all-night mode, default on)
  *  Version: 1.4 - built-in Seahawks 2026 schedule with kickoff windows; calendar switch now optional
  *  Version: 1.3 - per-light segment counts, scene alternatives (A | B), game-day "auto" mode
@@ -32,14 +33,15 @@ definition(
     description: "Date-window scene selection for Govee string lights (Halloween, game days, default)",
     category: "Lighting",
     iconUrl: "",
-    iconX2Url: ""
+    iconX2Url: "",
+    singleThreaded: true   // plug events arrive together; serialize handlers so unschedule/schedule pairs never interleave
 )
 
 preferences {
     page(name: "mainPage")
 }
 
-def appVersion() { return "1.5" }
+def appVersion() { return "1.6" }
 
 def mainPage() {
     dynamicPage(name: "mainPage", title: "Govee Holiday Scenes v${appVersion()}", install: true, uninstall: true) {
@@ -177,7 +179,13 @@ def powerOnHandler(evt) {
     logDebug "Power on: ${evt.displayName}"
     if (appPaused) { logDebug "Paused; ignoring power-on"; return }
 
-    // Collapse several plugs switching together into one set of attempts
+    // Collapse several plugs switching together into one set of attempts (singleThreaded keeps these two lines atomic;
+    // the time check keeps the attempt clock anchored to the first plug instead of sliding with each later one)
+    long sincePowerOn = now() - ((state.powerOnAt ?: 0L) as Long)
+    if (sincePowerOn >= 0 && sincePowerOn < 5000) {
+        logDebug "Power-on within ${sincePowerOn} ms of the last one; keeping the attempts already scheduled"
+        return
+    }
     unschedule("applyScenes")
     state.powerOnAt = now()
 
