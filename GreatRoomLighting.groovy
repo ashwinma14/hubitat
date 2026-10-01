@@ -6,6 +6,9 @@
  *
  *  Author: Claude (for Ashwin)
  *  Date: 2026-02-12
+ *  Version: 1.32 - dusk tuning from the first live evening: a dark-room turn-on starts at 55% (not 35%),
+ *                  main lights never dip on the Evening/Night mode change while dusk is still ramping,
+ *                  dining steps 50/75/100 with the factor, shorter dark-room debounce once outdoor lux is under 800
  *  Version: 1.31 - adaptive brightness: scene levels scale with outdoor lux, fades on every change,
  *                  sunrise-relative predawn with a morning ramp, kitchen cans only when dark, daytime debounce
  *  Version: 1.30 - Athom staleness guard with dead-sensor alerts, evening wind-down scene
@@ -25,7 +28,7 @@ preferences {
     page(name: "mainPage")
 }
 
-def appVersion() { return "1.31" }
+def appVersion() { return "1.32" }
 
 def mainPage() {
     dynamicPage(name: "mainPage", title: "Great Room Lighting Controller", install: true, uninstall: true) {
@@ -113,7 +116,11 @@ def mainPage() {
             input "sceneFadeSeconds", "number", title: "Fade for scene changes (seconds)", defaultValue: 3, required: true, width: 4
             input "predawnSunriseOffset", "number", title: "Predawn lasts until this many minutes before sunrise (or the predawn end time above, whichever is later)", defaultValue: 20, required: true, width: 6
             input "morningRampMinutes", "number", title: "Minutes to ramp from predawn levels to full once predawn ends", defaultValue: 30, required: true, width: 6
-            input "daytimeOnDebounceMinutes", "number", title: "Daytime with bright outdoors: the dark-room condition must hold this many minutes before the lights turn on", defaultValue: 10, required: true
+            input "daytimeOnDebounceMinutes", "number", title: "Daytime with bright outdoors: the dark-room condition must hold this many minutes before the lights turn on", defaultValue: 10, required: true, width: 4
+            input "duskLuxThreshold", "number", title: "...but once outdoor lux is below this, use the shorter dusk debounce", defaultValue: 800, required: true, width: 4
+            input "duskDebounceMinutes", "number", title: "Dusk debounce (minutes)", defaultValue: 3, required: true, width: 4
+            input "darkRoomMinFactor", "number", title: "When the room turned on because it measured dark, never run below this factor (%) until it turns off", defaultValue: 55, required: true
+            paragraph "Dining runs 50% / 75% / 100% as the factor reaches 55 / 75 / 100. On the Evening/Night mode change the living room, hallway and dining never step down while dusk is still ramping."
             paragraph adaptiveStatus()
         }
 
@@ -656,11 +663,13 @@ def indoorLuxHandler(evt) {
                 unschedule(turnOffDueToBright)
                 state.pendingBrightOff = false
                 if (daytimeDebounceApplies()) {
-                    // Bright outside, dim inside: make the condition hold before lighting the whole room in daylight
-                    Integer mins = (daytimeOnDebounceMinutes ?: 10) as Integer
+                    // Bright outside, dim inside: make the condition hold before lighting the whole room in daylight.
+                    // A passing cloud at midday gets the long debounce; real dusk (outdoor already under duskLuxThreshold) the short one.
+                    Integer mins = darkRoomDebounceMinutes()
                     if (!state.pendingDarkOn) {
                         state.pendingDarkOn = true
-                        log.info "Indoor lux ${lux} below ${threshold} in daylight - confirming for ${mins} minutes before turning on"
+                        state.pendingDarkMins = mins
+                        log.info "Indoor lux ${lux} below ${threshold} in daylight (outdoor ${outdoorLuxSensor?.currentIlluminance} lux) - confirming for ${mins} minutes before turning on"
                         runIn(mins * 60, "confirmDarkRoom")
                     }
                 } else {
@@ -847,6 +856,7 @@ def applyLrZoneLevel(Boolean occupied) {
     }
     state.lastAutomationAction = now()
     setLevelSmooth(lrHueLights, lrLevel, 5)
+    rememberLevels([lr: lrLevel])
     logDebug "LR zone level -> ${lrLevel}% (${occupied ? 'occupied' : 'unoccupied'})"
 }
 
@@ -1042,8 +1052,31 @@ Integer rampFactor() {
     return Math.min(100, (30 + (70 * elapsed / (mins * 60000L))) as Integer)
 }
 
+/** Ambient factor, raised to the dark-room floor while one is set (the room already measured dark), capped by the morning ramp. */
 Integer effectiveFactor() {
-    return Math.min(ambientFactor(), rampFactor())
+    Integer ambient = ambientFactor()
+    Integer floor = (state.factorFloor ?: 0) as Integer
+    return Math.min(Math.max(ambient, floor), rampFactor())
+}
+
+/** Dining Edisons dim poorly, so they step 50 / 75 / 100 with the factor instead of scaling continuously. */
+Integer diningLevelFor(Integer factor) {
+    if (factor >= 100) return 100
+    if (factor >= 75) return 75
+    return 50
+}
+
+/** During dusk (factor still below 100) a main light never steps down from its last commanded level. */
+Integer holdUp(Integer target, String key, boolean dusk) {
+    if (!dusk) return target
+    Integer last = ((state.lastLevels ?: [:])[key] ?: 0) as Integer
+    return Math.max(target, last)
+}
+
+def rememberLevels(Map levels) {
+    Map current = (state.lastLevels ?: [:]) as Map
+    levels.each { k, v -> current[k] = v }
+    state.lastLevels = current
 }
 
 /** Scale a scene level by the effective factor, never below 10% (or the level itself when lower) and never above 100. */
@@ -1125,11 +1158,22 @@ boolean daytimeDebounceApplies() {
     return lux != null && lux >= (adaptiveLux55 ?: 400)
 }
 
+/** Long debounce under a bright sky (a cloud passing), short once outdoor light is already fading. */
+Integer darkRoomDebounceMinutes() {
+    Integer dayMins = (daytimeOnDebounceMinutes ?: 10) as Integer
+    Integer duskMins = (duskDebounceMinutes ?: 3) as Integer
+    def lux = outdoorLuxSensor?.currentIlluminance
+    if (lux != null && lux < (duskLuxThreshold ?: 800)) return Math.max(0, Math.min(dayMins, duskMins))
+    return dayMins
+}
+
 def confirmDarkRoom() {
     state.pendingDarkOn = false
     state.lightNeeded = isLightNeeded()
     if (state.lightNeeded && state.presenceActive && !state.manualOverride && !state.tvTimeActive) {
-        log.info "Dark room held for ${daytimeOnDebounceMinutes ?: 10} minutes - turning on lights"
+        // The room has proven it is dark: the "still bright outside" 35% band would barely register, so hold a floor until the room turns off
+        state.factorFloor = (darkRoomMinFactor ?: 55) as Integer
+        log.info "Dark room held for ${state.pendingDarkMins ?: daytimeOnDebounceMinutes ?: 10} minutes - turning on lights (factor floor ${state.factorFloor}%)"
         evaluateLighting("dark room confirmed")
     } else {
         log.info "Dark-room condition cleared before the debounce ended - not turning on"
@@ -1141,7 +1185,8 @@ String adaptiveStatus() {
     Integer endMins = predawnEndMinutes()
     String predawnAt = String.format('%02d:%02d', (endMins / 60) as Integer, endMins % 60)
     String ramp = state.morningRamp ? "morning ramp at ${rampFactor()}%" : "no morning ramp running"
-    return "Outdoor ${lux != null ? lux + ' lux' : 'sensor missing'}: band ${rawAmbientFactor()}%, applied factor ${state.ambientFactor ?: '-'}%; " +
+    String floor = state.factorFloor ? ", dark-room floor ${state.factorFloor}%" : ""
+    return "Outdoor ${lux != null ? lux + ' lux' : 'sensor missing'}: band ${rawAmbientFactor()}%, applied factor ${state.ambientFactor ?: '-'}%${floor}; " +
            "${ramp}; predawn ends ${predawnAt} today; scene now: ${state.currentScene ?: 'off'}; " +
            "cans ${cansWanted() ? 'allowed' : 'held off'} (threshold ${cansLuxThreshold ?: 150} lux)"
 }
@@ -1156,17 +1201,18 @@ def applyDayScene(Number fadeOverride = null) {
     
     // Check if living room is occupied (default to true if sensor not configured)
     def lrOccupied = (livingRoomPresence && !isAthomStale()) ? (livingRoomPresence.currentValue("mmwave") == "active") : true
-    def lrLevel = scaled(lrOccupied ? (dayHueLevel ?: 100) : 50)
-    
-    // Dining Edisons: two-step base (100% once dark outside, else 50%), scaled by the factor, never below 50%
-    def diningLevel = Math.max(50, scaled(getDiningLevelForAmbient()))
+    Integer lrLevel = scaled(lrOccupied ? (dayHueLevel ?: 100) : 50)
+    Integer hallwayLevel = scaled(dayHallwayLevel ?: 99)
+
+    // Dining Edisons step 50 / 75 / 100 with the factor
+    Integer diningLevel = diningLevelFor(factor)
     boolean cansOn = cansWanted()
-    
+
     logDebug "Day scene: factor=${factor}%, fade=${fade}s, LR occupied=${lrOccupied}, lrLevel=${lrLevel}, diningLevel=${diningLevel}, cans=${cansOn}"
-    
+
     // Kitchen/Hallway zone
     setLevelSmooth(diningSwitch, diningLevel, fade)
-    setLevelSmooth(hallwaySwitch, scaled(dayHallwayLevel ?: 99), fade)
+    setLevelSmooth(hallwaySwitch, hallwayLevel, fade)
     setCans(cansOn)
     setLevelSmooth(kitchenPendant, scaled(dayKitchenPendantLevel ?: 100), fade)
     
@@ -1182,7 +1228,8 @@ def applyDayScene(Number fadeOverride = null) {
     
     activatorSwitch?.on()
     state.currentScene = "day"
-    
+    rememberLevels([lr: lrLevel, hallway: hallwayLevel, dining: diningLevel])
+
     log.info "Day scene applied (factor ${factor}%, fade ${fade}s, LR ${lrOccupied ? 'occupied' : 'unoccupied'} ${lrLevel}%, dining ${diningLevel}%, cans ${cansOn ? 'on' : 'off'})"
     safeLogToSheet("scene", "Day", "factor ${factor}% LR ${lrLevel}% dining ${diningLevel}%", currentLux)
 }
@@ -1196,17 +1243,20 @@ def applyNightScene(Number fadeOverride = null) {
     // Check if living room is occupied (default to true if sensor not configured)
     def lrOccupied = (livingRoomPresence && !isAthomStale()) ? (livingRoomPresence.currentValue("mmwave") == "active") : true
     def lrFull = nightHueLevel ?: 80
-    def lrLevel = scaled(lrOccupied ? lrFull : ((lrFull * 50 / 100) as Integer))
-    
-    // Dining Edisons: two-step base (100% once dark outside, else 50%), scaled by the factor, never below 50%
-    def diningLevel = Math.max(50, scaled(getDiningLevelForAmbient()))
+
+    // Dusk hold: while the factor is still climbing and the room was already lit by the day/night scene,
+    // the main lights never step down (the night bases are lower than the day bases, so the mode change used to dip them)
+    boolean dusk = factor < 100 && roomIsOn() && (state.currentScene in ["day", "night"])
+    Integer lrLevel = holdUp(scaled(lrOccupied ? lrFull : ((lrFull * 50 / 100) as Integer)), "lr", dusk && lrOccupied)
+    Integer hallwayLevel = holdUp(scaled(nightHallwayLevel ?: 80), "hallway", dusk)
+    Integer diningLevel = holdUp(diningLevelFor(factor), "dining", dusk)
     boolean cansOn = cansWanted()
-    
-    logDebug "Night scene: factor=${factor}%, fade=${fade}s, LR occupied=${lrOccupied}, lrLevel=${lrLevel}, diningLevel=${diningLevel}, cans=${cansOn}"
-    
+
+    logDebug "Night scene: factor=${factor}%, fade=${fade}s, dusk hold=${dusk}, LR occupied=${lrOccupied}, lrLevel=${lrLevel}, hallway=${hallwayLevel}, diningLevel=${diningLevel}, cans=${cansOn}"
+
     // Kitchen/Hallway zone
     setLevelSmooth(diningSwitch, diningLevel, fade)
-    setLevelSmooth(hallwaySwitch, scaled(nightHallwayLevel ?: 80), fade)
+    setLevelSmooth(hallwaySwitch, hallwayLevel, fade)
     setCans(cansOn)
     setLevelSmooth(kitchenPendant, scaled(nightKitchenPendantLevel ?: 30), fade)
     
@@ -1222,8 +1272,9 @@ def applyNightScene(Number fadeOverride = null) {
     
     activatorSwitch?.on()
     state.currentScene = "night"
-    
-    log.info "Night scene applied (factor ${factor}%, fade ${fade}s, LR ${lrOccupied ? 'occupied' : 'unoccupied'} ${lrLevel}%, dining ${diningLevel}%, cans ${cansOn ? 'on' : 'off'})"
+    rememberLevels([lr: lrLevel, hallway: hallwayLevel, dining: diningLevel])
+
+    log.info "Night scene applied (factor ${factor}%, fade ${fade}s${dusk ? ', dusk hold' : ''}, LR ${lrOccupied ? 'occupied' : 'unoccupied'} ${lrLevel}%, hallway ${hallwayLevel}%, dining ${diningLevel}%, cans ${cansOn ? 'on' : 'off'})"
     safeLogToSheet("scene", "Night", "factor ${factor}% LR ${lrLevel}% dining ${diningLevel}%", currentLux)
 }
 
@@ -1346,6 +1397,8 @@ def turnAllLightsOff() {
     // Clear the turningOff flag after a delay
     runIn(3, clearTurningOffFlag)
     state.currentScene = "off"
+    state.factorFloor = null     // the dark-room floor lasts only while the room is lit
+    state.lastLevels = null      // nothing to hold against once everything is off
     
     log.info "All lights turned off"
     safeLogToSheet("scene", "Off", "all lights off", currentLux)
