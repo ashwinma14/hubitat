@@ -7,7 +7,7 @@ deployed through the hub's MCP Rule Server (`importUrl`), with `deploy.sh` as th
 
 | File | App | Hub instance |
 |------|-----|--------------|
-| GreatRoomLighting.groovy | Great Room Lighting Controller (v1.31) | app:584 (Apps Code id 529) |
+| GreatRoomLighting.groovy | Great Room Lighting Controller (v1.32) | app:584 (Apps Code id 529) |
 | GoveeHolidayScenes.groovy | Govee Holiday Scenes (v1.5) — scene-by-date for the Govee string lights | (installed from Apps Code) |
 | GreatRoomLightingLogger.gs | Google Apps Script webhook for Sheets logging | (Google) |
 | tools/LuxCsvRepair.groovy | One-off utility: rebuilt `lux_clean.csv` on 2026-09-30 (used once, then removed from the hub) | none |
