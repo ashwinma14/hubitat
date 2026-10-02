@@ -6,6 +6,8 @@
  *
  *  Author: Claude (for Ashwin)
  *  Date: 2026-02-12
+ *  Version: 1.34 - kitchen cans also come on whenever the room itself measured dark (not only once outdoor
+ *                  lux is under the cans threshold), and they join at the end of the room's fade-in
  *  Version: 1.33 - second indoor lux sensor (kitchen Hue, true lux): the room counts as dark when either sensor
  *                  says so, because the bookcase ZSE40 caps at 100% and then goes silent for hours; the dark-room
  *                  factor floor now applies to every daytime turn-on; dusk debounce threshold 1000 lux
@@ -31,7 +33,7 @@ preferences {
     page(name: "mainPage")
 }
 
-def appVersion() { return "1.33" }
+def appVersion() { return "1.34" }
 
 def mainPage() {
     dynamicPage(name: "mainPage", title: "Great Room Lighting Controller", install: true, uninstall: true) {
@@ -1104,8 +1106,14 @@ Integer scaled(Number base) {
     return Math.min(100, Math.max(Math.min(10, b), v))
 }
 
+/**
+ * The cans are on/off only. At an ordinary dusk the dimmable lights carry the first steps and the cans join once
+ * outdoor light is under cansLuxThreshold. When the room itself measured dark (factor floor set) they are wanted
+ * right away: that reading is the direct evidence that the overhead light is needed.
+ */
 boolean cansWanted() {
     if (adaptiveEnabled == false) return true
+    if (state.factorFloor) return true
     def lux = outdoorLuxSensor?.currentIlluminance
     if (lux == null) return true
     return lux < (cansLuxThreshold ?: 150)
@@ -1114,7 +1122,25 @@ boolean cansWanted() {
 def setCans(boolean on) {
     if (!kitchenCans) return
     if (on && kitchenCans.currentSwitch != "on") kitchenCans.on()
-    else if (!on && kitchenCans.currentSwitch != "off") kitchenCans.off()
+    else if (!on) {
+        unschedule("cansOnDelayed")
+        if (kitchenCans.currentSwitch != "off") kitchenCans.off()
+    }
+}
+
+/** Cans cannot fade, so while the rest of the room is fading in they join at the end of the fade instead of popping on first. */
+def applyCans(boolean on, Integer fade) {
+    if (!kitchenCans) return
+    if (!on) { setCans(false); return }
+    if (kitchenCans.currentSwitch == "on") return
+    if ((fade ?: 0) <= 5) { setCans(true); return }
+    runIn(fade, "cansOnDelayed")
+}
+
+def cansOnDelayed() {
+    if (!(state.currentScene in ["day", "night"]) || !roomIsOn()) return
+    if (state.manualOverride || state.tvTimeActive) return
+    if (cansWanted()) setCans(true)
 }
 
 boolean roomIsOn() {
@@ -1205,7 +1231,7 @@ String adaptiveStatus() {
     String floor = state.factorFloor ? ", dark-room floor ${state.factorFloor}%" : ""
     return "Outdoor ${lux != null ? lux + ' lux' : 'sensor missing'}: band ${rawAmbientFactor()}%, applied factor ${state.ambientFactor ?: '-'}%${floor}; " +
            "${ramp}; predawn ends ${predawnAt} today; scene now: ${state.currentScene ?: 'off'}; " +
-           "cans ${cansWanted() ? 'allowed' : 'held off'} (threshold ${cansLuxThreshold ?: 150} lux)"
+           "cans ${cansWanted() ? 'allowed' : 'held off'} (outdoor under ${cansLuxThreshold ?: 150} lux, or the room measured dark)"
 }
 
 // ==================== SCENE ACTIONS ====================
@@ -1235,7 +1261,7 @@ def applyDayScene(Number fadeOverride = null) {
     // Kitchen/Hallway zone
     setLevelSmooth(diningSwitch, diningLevel, fade)
     setLevelSmooth(hallwaySwitch, hallwayLevel, fade)
-    setCans(cansOn)
+    applyCans(cansOn, fade)
     setLevelSmooth(kitchenPendant, scaled(dayKitchenPendantLevel ?: 100), fade)
     
     // Living Room zone - only ceiling dims when unoccupied, bookcase stays constant
@@ -1279,7 +1305,7 @@ def applyNightScene(Number fadeOverride = null) {
     // Kitchen/Hallway zone
     setLevelSmooth(diningSwitch, diningLevel, fade)
     setLevelSmooth(hallwaySwitch, hallwayLevel, fade)
-    setCans(cansOn)
+    applyCans(cansOn, fade)
     setLevelSmooth(kitchenPendant, scaled(nightKitchenPendantLevel ?: 30), fade)
     
     // Living Room zone - only ceiling dims when unoccupied, bookcase stays constant
@@ -1381,6 +1407,7 @@ def applyTvScene() {
     
     // Turn off other lights
     if (tvOtherLightsOff != false) {
+        unschedule("cansOnDelayed")
         diningSwitch?.off()
         hallwaySwitch?.off()
         kitchenCans?.off()
@@ -1407,6 +1434,7 @@ def turnAllLightsOff() {
     state.turningOff = true
     def currentLux = luxSensor?.currentIlluminance ?: 0
     
+    unschedule("cansOnDelayed")
     diningSwitch?.off()
     hallwaySwitch?.off()
     kitchenCans?.off()
