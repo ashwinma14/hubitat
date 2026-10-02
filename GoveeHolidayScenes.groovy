@@ -468,8 +468,8 @@ def scheduleTodaysGame() {
         runOnce(upcoming.start, "gameWindowStart")
         state.gameMinEnd = upcoming.minEnd.time
         state.gameLabel = upcoming.game.label
-        log.info "Game day: ${upcoming.game.label} kicks off ${upcoming.game.time}; game look from ${upcoming.start.format('HH:mm', location.timeZone)}" +
-                 (gameAllNight != false ? " until the lights go off for the night" : " to ${upcoming.end.format('HH:mm', location.timeZone)}")
+        log.info "Game day: ${upcoming.game.label} kicks off ${upcoming.game.time}; game look whenever the lights are on from ${upcoming.start.format('HH:mm', location.timeZone)}" +
+                 (gameAllNight != false ? " until they go off for the night" : " to ${upcoming.end.format('HH:mm', location.timeZone)}")
     } else {
         logDebug "No game today"
     }
@@ -514,8 +514,8 @@ String nextGameText() {
     if (!upcoming) return "none left in the table"
     Map w = gameWindow(upcoming)
     String when = gameKickoff(upcoming).format("EEE MMM d, h:mm a", location.timeZone)
-    String win = gameAllNight != false ? "from ${w.start.format('h:mm a', location.timeZone)} until the lights go off that night" : "${w.start.format('h:mm a', location.timeZone)} to ${w.end.format('h:mm a', location.timeZone)}"
-    return "${upcoming.label}, kickoff ${when} (game look ${win})${state.gameWindowActive ? ' - ACTIVE NOW' : ''}"
+    String win = gameAllNight != false ? "whenever the lights are on from ${w.start.format('h:mm a', location.timeZone)} until they go off for the night" : "while the lights are on between ${w.start.format('h:mm a', location.timeZone)} and ${w.end.format('h:mm a', location.timeZone)}"
+    return "${upcoming.label}, kickoff ${when} (game look ${win}; this app never switches the lights on, the plug automation does that at dusk)${state.gameWindowActive ? ' - ACTIVE NOW' : ''}"
 }
 
 /** The driver only records effectNum when Govee's cloud accepted the command, so a mismatch means it failed (usually "device offline"). */
