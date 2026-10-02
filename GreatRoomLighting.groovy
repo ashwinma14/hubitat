@@ -6,6 +6,8 @@
  *
  *  Author: Claude (for Ashwin)
  *  Date: 2026-02-12
+ *  Version: 1.35 - living-room PIR as a second opinion for zone dimming: the ceiling never dims while the PIR
+ *                  has seen motion in the last few minutes, and PIR motion re-brightens a ceiling the mmWave dimmed
  *  Version: 1.34 - kitchen cans also come on whenever the room itself measured dark (not only once outdoor
  *                  lux is under the cans threshold), and they join at the end of the room's fade-in
  *  Version: 1.33 - second indoor lux sensor (kitchen Hue, true lux): the room counts as dark when either sensor
@@ -33,7 +35,7 @@ preferences {
     page(name: "mainPage")
 }
 
-def appVersion() { return "1.34" }
+def appVersion() { return "1.35" }
 
 def mainPage() {
     dynamicPage(name: "mainPage", title: "Great Room Lighting Controller", install: true, uninstall: true) {
@@ -41,6 +43,7 @@ def mainPage() {
         section("<b>Devices</b>") {
             input "motionZone", "capability.motionSensor", title: "Motion Zone", required: true
             input "livingRoomPresence", "capability.motionSensor", title: "Living Room Presence Sensor (Athom - for zone dimming)", required: false
+            input "lrMotionSensor", "capability.motionSensor", title: "Living room motion sensor (PIR second opinion: the ceiling never dims while it has seen motion recently, and its motion re-brightens a dimmed ceiling)", required: false
             input "kitchenPresence", "capability.motionSensor", title: "Kitchen Presence Sensor (FP1E - for true presence)", required: false
             input "indoorLuxSensor", "capability.illuminanceMeasurement", title: "Indoor Lux Sensor (for dark room detection)", required: false
             input "indoorLuxSensor2", "capability.illuminanceMeasurement", title: "Second indoor lux sensor (true-lux sensor such as the kitchen Hue motion sensor; the room counts as dark when EITHER sensor says so)", required: false
@@ -68,6 +71,7 @@ def mainPage() {
             input "lightsOffDelay", "number", title: "Seconds delay before turning lights off", defaultValue: 10, required: true
             input "lrDimDelay", "number", title: "Seconds before LR ceiling dims after leaving the room", defaultValue: 60, required: true
             input "lrBrightHoldMinutes", "number", title: "Minimum minutes LR ceiling stays bright after brightening (anti-flicker)", defaultValue: 3, required: true
+            input "lrDimVetoMinutes", "number", title: "Minutes since the LR motion sensor last saw motion before the ceiling may dim", defaultValue: 3, required: true
         }
         
         section("<b>TV Time</b>") {
@@ -174,6 +178,7 @@ def initialize() {
     log.info "Devices configured:"
     log.info "  Motion Zone: ${motionZone?.displayName}"
     log.info "  Living Room Presence: ${livingRoomPresence?.displayName ?: 'not configured'}"
+    log.info "  Living Room Motion (PIR): ${lrMotionSensor?.displayName ?: 'not configured'}"
     log.info "  Kitchen Presence: ${kitchenPresence?.displayName ?: 'not configured'}"
     log.info "  Indoor Lux Sensor: ${indoorLuxSensor?.displayName ?: 'not configured'}"
     log.info "  Indoor Lux Sensor 2: ${indoorLuxSensor2?.displayName ?: 'not configured'}"
@@ -200,6 +205,12 @@ def initialize() {
         subscribe(livingRoomPresence, "mmwave", truePresenceHandler)
     }
     
+    // Living-room PIR: second opinion for the zone dim
+    if (lrMotionSensor) {
+        subscribe(lrMotionSensor, "motion.active", lrMotionHandler)
+        if (lrMotionSensor.currentMotion == "active") state.lastLrMotionAt = now()
+    }
+
     // Subscribe to kitchen presence for true presence detection
     if (kitchenPresence) {
         subscribe(kitchenPresence, "roomState", truePresenceHandler)
@@ -831,6 +842,34 @@ def livingRoomPresenceHandler(evt) {
     }
 }
 
+/** Living room occupied: the mmWave says active, or the PIR saw motion within lrDimVetoMinutes (the mmWave misses people sitting still). */
+boolean livingRoomOccupied() {
+    boolean mm = (livingRoomPresence && !isAthomStale()) ? (livingRoomPresence.currentValue("mmwave") == "active") : true
+    return mm || pirRecent()
+}
+
+boolean pirRecent() {
+    if (!lrMotionSensor) return false
+    if (lrMotionSensor.currentMotion == "active") return true
+    return pirVetoRemainingMs() > 0
+}
+
+long pirVetoRemainingMs() {
+    long vetoMs = ((lrDimVetoMinutes ?: 3) as Long) * 60000L
+    return vetoMs - (now() - ((state.lastLrMotionAt ?: 0L) as Long))
+}
+
+def lrMotionHandler(evt) {
+    state.lastLrMotionAt = now()
+    // The mmWave said the room was empty but the PIR disagrees: bring the ceiling back, then let the normal dim check run again
+    if (state.lrDimmed && lrHueLights?.currentSwitch == "on" && !state.manualOverride && !state.tvTimeActive) {
+        log.info "${evt.displayName} saw motion while the LR ceiling was dimmed (mmWave says ${livingRoomPresence?.currentValue('mmwave')}) - brightening"
+        unschedule(applyLrDimmed)
+        applyLrZoneLevel(true)
+        runIn(lrDimDelay ?: 60, applyLrDimmed)
+    }
+}
+
 def applyLrDimmed() {
     // Never dim on a dead sensor's last word - fail bright
     if (isAthomStale()) {
@@ -843,6 +882,15 @@ def applyLrDimmed() {
     def lightsOn = lrHueLights?.currentSwitch == "on"
 
     if (mmwaveState != "inactive" || !lightsOn || state.manualOverride || state.tvTimeActive) {
+        return
+    }
+
+    // PIR veto: someone sitting still fools the mmWave but not a PIR that saw them move a minute ago
+    if (pirRecent()) {
+        Integer waitSec = Math.max(5, ((pirVetoRemainingMs() / 1000) as Integer) + 1)
+        if (lrMotionSensor?.currentMotion == "active") waitSec = Math.max(waitSec, ((lrDimVetoMinutes ?: 3) as Integer) * 60)
+        logDebug "LR dim deferred ${waitSec}s (${lrMotionSensor?.displayName} saw motion recently)"
+        runIn(waitSec, applyLrDimmed)
         return
     }
 
@@ -869,6 +917,7 @@ def applyLrZoneLevel(Boolean occupied) {
     if (occupied) {
         state.lastLrBrightenTime = now()
     }
+    state.lrDimmed = !occupied
     if (lrHueLights?.currentLevel == lrLevel && lrHueLights?.currentSwitch == "on") {
         logDebug "LR zone level already ${lrLevel}% - skipping"
         return
@@ -1248,7 +1297,7 @@ def applyDayScene(Number fadeOverride = null) {
     Integer factor = effectiveFactor()
     
     // Check if living room is occupied (default to true if sensor not configured)
-    def lrOccupied = (livingRoomPresence && !isAthomStale()) ? (livingRoomPresence.currentValue("mmwave") == "active") : true
+    def lrOccupied = livingRoomOccupied()
     Integer lrLevel = scaled(lrOccupied ? (dayHueLevel ?: 100) : 50)
     Integer hallwayLevel = scaled(dayHallwayLevel ?: 99)
 
@@ -1268,6 +1317,7 @@ def applyDayScene(Number fadeOverride = null) {
     setLevelSmooth(bookcaseGOLamp, scaled(dayBookcaseLevel ?: 50), fade)
     setLevelSmooth(bookcaseColorLamp, scaled(dayBookcaseLevel ?: 50), fade)
     setLevelSmooth(lrHueLights, lrLevel, fade)
+    state.lrDimmed = !lrOccupied
     
     // Set color temp if supported (warm white)
     if (lrHueLights?.hasCommand("setColorTemperature")) {
@@ -1289,7 +1339,7 @@ def applyNightScene(Number fadeOverride = null) {
     Integer factor = effectiveFactor()
     
     // Check if living room is occupied (default to true if sensor not configured)
-    def lrOccupied = (livingRoomPresence && !isAthomStale()) ? (livingRoomPresence.currentValue("mmwave") == "active") : true
+    def lrOccupied = livingRoomOccupied()
     def lrFull = nightHueLevel ?: 80
 
     // Dusk hold: while the factor is still climbing and the room was already lit by the day/night scene,
@@ -1312,6 +1362,7 @@ def applyNightScene(Number fadeOverride = null) {
     setLevelSmooth(bookcaseGOLamp, scaled(nightBookcaseLevel ?: 15), fade)
     setLevelSmooth(bookcaseColorLamp, scaled(nightBookcaseLevel ?: 15), fade)
     setLevelSmooth(lrHueLights, lrLevel, fade)
+    state.lrDimmed = !lrOccupied
     
     // Set color temp if supported (warm white)
     if (lrHueLights?.hasCommand("setColorTemperature")) {
@@ -1330,7 +1381,7 @@ def applyPredawnScene() {
     state.lastAutomationAction = now()
     def currentLux = luxSensor?.currentIlluminance ?: 0
 
-    def lrOccupied = (livingRoomPresence && !isAthomStale()) ? (livingRoomPresence.currentValue("mmwave") == "active") : true
+    def lrOccupied = livingRoomOccupied()
     def lrFull = predawnHueLevel ?: 30
     def lrLevel = lrOccupied ? lrFull : ((lrFull * 50 / 100) as Integer)
     if (lrOccupied) {
@@ -1363,7 +1414,7 @@ def applyWindDownScene() {
     state.lastAutomationAction = now()
     def currentLux = luxSensor?.currentIlluminance ?: 0
 
-    def lrOccupied = (livingRoomPresence && !isAthomStale()) ? (livingRoomPresence.currentValue("mmwave") == "active") : true
+    def lrOccupied = livingRoomOccupied()
     def lrFull = windDownHueLevel ?: 50
     def lrLevel = lrOccupied ? lrFull : ((lrFull * 50 / 100) as Integer)
     if (lrOccupied) {
