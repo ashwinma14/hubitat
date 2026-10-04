@@ -282,7 +282,12 @@ def initialize() {
     // Adaptive brightness bookkeeping
     state.ambientFactor = rawAmbientFactor()
     state.ambientChangedAt = now()
-    state.morningRamp = null
+    // Keep a morning ramp that is still running across an app update; otherwise a deploy mid-ramp jumps the room to 100%
+    if (state.morningRamp && rampFactor() < 100) {
+        runIn(180, "morningRampStep")
+    } else {
+        state.morningRamp = null
+    }
     state.pendingDarkOn = false
     state.currentScene = state.currentScene ?: "off"
     runEvery10Minutes(ambientRecheck)
