@@ -6,6 +6,9 @@
  *
  *  Author: Claude (for Ashwin)
  *  Date: 2026-02-12
+ *  Version: 1.37 - two zones: the living room is a dead end, so it counts as occupied until something outside it
+ *                  moves after it last did (sitting still no longer times the house out); the kitchen/dining/hallway
+ *                  zone dims to a low level after a few quiet minutes while the room is on and restores on motion
  *  Version: 1.36 - mornings dim as gradually as dusks brighten: the ambient factor steps down one band at a time,
  *                  the hold-up only applies while the factor is rising, a mode change on a lit room fades over the
  *                  ambient fade, and the kitchen cans wait for a 75% factor instead of the dark-room floor
@@ -38,7 +41,7 @@ preferences {
     page(name: "mainPage")
 }
 
-def appVersion() { return "1.36" }
+def appVersion() { return "1.37" }
 
 def mainPage() {
     dynamicPage(name: "mainPage", title: "Great Room Lighting Controller", install: true, uninstall: true) {
@@ -47,6 +50,7 @@ def mainPage() {
             input "motionZone", "capability.motionSensor", title: "Motion Zone", required: true
             input "livingRoomPresence", "capability.motionSensor", title: "Living Room Presence Sensor (Athom - for zone dimming)", required: false
             input "lrMotionSensor", "capability.motionSensor", title: "Living room motion sensor (PIR second opinion: the ceiling never dims while it has seen motion recently, and its motion re-brightens a dimmed ceiling)", required: false
+            input "kitchenZoneSensors", "capability.motionSensor", title: "Kitchen/dining/hallway motion sensors (everything outside the living room; the kitchen presence sensor above counts too)", multiple: true, required: false
             input "kitchenPresence", "capability.motionSensor", title: "Kitchen Presence Sensor (FP1E - for true presence)", required: false
             input "indoorLuxSensor", "capability.illuminanceMeasurement", title: "Indoor Lux Sensor (for dark room detection)", required: false
             input "indoorLuxSensor2", "capability.illuminanceMeasurement", title: "Second indoor lux sensor (true-lux sensor such as the kitchen Hue motion sensor; the room counts as dark when EITHER sensor says so)", required: false
@@ -75,6 +79,15 @@ def mainPage() {
             input "lrDimDelay", "number", title: "Seconds before LR ceiling dims after leaving the room", defaultValue: 60, required: true
             input "lrBrightHoldMinutes", "number", title: "Minimum minutes LR ceiling stays bright after brightening (anti-flicker)", defaultValue: 3, required: true
             input "lrDimVetoMinutes", "number", title: "Minutes since the LR motion sensor last saw motion before the ceiling may dim", defaultValue: 3, required: true
+        }
+
+        section("<b>Zones</b>") {
+            paragraph "The living room is a dead end: once it has seen someone, it stays occupied until a sensor outside it fires after the living room last did. Sitting still never times the house out; walking out through the kitchen does. The kitchen/dining/hallway zone dims after a few quiet minutes while the room is on and comes straight back on motion."
+            input "lrBackstopMinutes", "number", title: "Living room: give up the dead-end inference after this many minutes with no activity anywhere", defaultValue: 45, required: true, width: 6
+            input "lrExitGraceSeconds", "number", title: "Kitchen-zone activity within this many seconds after living-room activity counts as the same movement", defaultValue: 20, required: true, width: 6
+            input "kzDimMinutes", "number", title: "Kitchen zone dims after this many quiet minutes", defaultValue: 5, required: true, width: 4
+            input "kzDimPercent", "number", title: "Dimmed hallway and pendant: percent of their scene level", defaultValue: 30, required: true, width: 4
+            input "kzDiningDim", "number", title: "Dimmed dining level", defaultValue: 30, required: true, width: 4
         }
         
         section("<b>TV Time</b>") {
@@ -182,6 +195,7 @@ def initialize() {
     log.info "  Motion Zone: ${motionZone?.displayName}"
     log.info "  Living Room Presence: ${livingRoomPresence?.displayName ?: 'not configured'}"
     log.info "  Living Room Motion (PIR): ${lrMotionSensor?.displayName ?: 'not configured'}"
+    log.info "  Kitchen Zone Sensors: ${kitchenZoneSensors ? kitchenZoneSensors*.displayName.join(', ') : 'not configured'}"
     log.info "  Kitchen Presence: ${kitchenPresence?.displayName ?: 'not configured'}"
     log.info "  Indoor Lux Sensor: ${indoorLuxSensor?.displayName ?: 'not configured'}"
     log.info "  Indoor Lux Sensor 2: ${indoorLuxSensor2?.displayName ?: 'not configured'}"
@@ -213,6 +227,19 @@ def initialize() {
         subscribe(lrMotionSensor, "motion.active", lrMotionHandler)
         if (lrMotionSensor.currentMotion == "active") state.lastLrMotionAt = now()
     }
+
+    // Kitchen zone: activity bookkeeping for the dead-end inference, and the quiet-time dim
+    if (kitchenZoneSensors) {
+        subscribe(kitchenZoneSensors, "motion.active", kzActiveHandler)
+        subscribe(kitchenZoneSensors, "motion.inactive", kzInactiveHandler)
+    }
+    if (kitchenPresence) {
+        subscribe(kitchenPresence, "roomState.occupied", kzActiveHandler)
+        subscribe(kitchenPresence, "roomState.unoccupied", kzInactiveHandler)
+    }
+    state.kzDimmed = false
+    if (kzActive()) state.kzLastMotionAt = now()
+    else if (kitchenZoneSensors) runIn(((kzDimMinutes ?: 5) as Integer) * 60, "kzDimCheck")
 
     // Subscribe to kitchen presence for true presence detection
     if (kitchenPresence) {
@@ -647,6 +674,16 @@ def presenceTimedOut() {
         runIn(120, presenceTimedOut)
         return
     }
+
+    // Dead-end inference: the living room last saw someone and nothing outside it has moved since, so they are still there
+    if (lrSticky()) {
+        long quietMin = (now() - ((state.lastLrMotionAt ?: 0L) as Long)) / 60000L
+        log.info "Presence timeout, but the living room is a dead end and nothing outside it has moved since it was last occupied (${quietMin} min ago) - keeping the lights (backstop ${lrBackstopMinutes ?: 45} min)"
+        safeLogToSheet("timeout", "extended", "Living room dead-end inference", currentLux)
+        state.pendingPresenceOff = false
+        runIn(300, presenceTimedOut)
+        return
+    }
     
     safeLogToSheet("timeout", "completed", "Presence cleared", currentLux)
     
@@ -829,6 +866,7 @@ def resetTvTime() {
 
 def livingRoomPresenceHandler(evt) {
     logDebug "Living room presence: ${evt.value}"
+    if (evt.value == "active") state.lastLrMotionAt = now()
     
     // Check if lights are actually on (not relying on state variables)
     def lightsOn = lrHueLights?.currentSwitch == "on"
@@ -839,6 +877,7 @@ def livingRoomPresenceHandler(evt) {
         
         if (evt.value == "active") {
             // Cancel any pending dim and immediately brighten (LR ceiling only)
+            state.lastLrMotionAt = now()
             unschedule(applyLrDimmed)
             safeLogToSheet("zone", "LR active", "brightening", currentLux)
             applyLrZoneLevel(true)
@@ -850,10 +889,79 @@ def livingRoomPresenceHandler(evt) {
     }
 }
 
-/** Living room occupied: the mmWave says active, or the PIR saw motion within lrDimVetoMinutes (the mmWave misses people sitting still). */
+/** Living room occupied: the mmWave says active, the PIR saw motion within lrDimVetoMinutes, or the dead-end inference holds. */
 boolean livingRoomOccupied() {
     boolean mm = (livingRoomPresence && !isAthomStale()) ? (livingRoomPresence.currentValue("mmwave") == "active") : true
-    return mm || pirRecent()
+    return mm || pirRecent() || lrSticky()
+}
+
+/**
+ * Dead-end inference. The only way out of the living room passes the kitchen-zone sensors, so if the living room
+ * fired more recently than anything outside it (allowing a short grace for the same movement tripping both),
+ * the person is still in there, however still they sit. Expires after lrBackstopMinutes of silence everywhere.
+ */
+boolean lrSticky() {
+    if (!kitchenZoneSensors && !kitchenPresence) return false
+    long lr = (state.lastLrMotionAt ?: 0L) as Long
+    if (lr == 0L) return false
+    if (now() - lr > ((lrBackstopMinutes ?: 45) as Long) * 60000L) return false
+    long kz = (state.kzLastMotionAt ?: 0L) as Long
+    return lr + ((lrExitGraceSeconds ?: 20) as Long) * 1000L >= kz
+}
+
+// ==================== KITCHEN ZONE (everything outside the living room) ====================
+
+boolean kzActive() {
+    if (kitchenZoneSensors?.any { it.currentMotion == "active" }) return true
+    return kitchenPresence?.currentValue("roomState") == "occupied"
+}
+
+def kzActiveHandler(evt) {
+    state.kzLastMotionAt = now()
+    unschedule("kzDimCheck")
+    if (state.kzDimmed) kzRestore("${evt.displayName} ${evt.value}")
+}
+
+def kzInactiveHandler(evt) {
+    if (kzActive()) return
+    runIn(((kzDimMinutes ?: 5) as Integer) * 60, "kzDimCheck", [overwrite: true])
+}
+
+def kzDimCheck() {
+    if (state.kzDimmed || kzActive()) return
+    if (!(state.currentScene in ["day", "night"]) || !roomIsOn()) return
+    if (state.manualOverride || state.tvTimeActive) return
+    Map full = state.kzFull as Map
+    if (!full) return
+    state.kzDimmed = true
+    state.lastAutomationAction = now()
+    Integer h = kzDimOf(full.hallway as Integer)
+    Integer p = kzDimOf(full.pendant as Integer)
+    Integer d = (kzDiningDim ?: 30) as Integer
+    setLevelSmooth(hallwaySwitch, h, 5)
+    setLevelSmooth(kitchenPendant, p, 5)
+    setLevelSmooth(diningSwitch, d, 5)
+    setCans(false)
+    log.info "Kitchen zone quiet for ${kzDimMinutes ?: 5} min - dimmed (hallway ${h}%, pendant ${p}%, dining ${d}%, cans off); living room ${livingRoomOccupied() ? 'occupied' : 'empty'}"
+}
+
+def kzRestore(String reason) {
+    state.kzDimmed = false
+    if (!(state.currentScene in ["day", "night"]) || !roomIsOn()) return
+    if (state.manualOverride || state.tvTimeActive) return
+    Map full = state.kzFull as Map
+    if (!full) return
+    state.lastAutomationAction = now()
+    setLevelSmooth(hallwaySwitch, full.hallway as Integer, 5)
+    setLevelSmooth(kitchenPendant, full.pendant as Integer, 5)
+    setLevelSmooth(diningSwitch, full.dining as Integer, 5)
+    if (full.cans) setCans(true)
+    log.info "Kitchen zone active (${reason}) - restored (hallway ${full.hallway}%, pendant ${full.pendant}%, dining ${full.dining}%, cans ${full.cans ? 'on' : 'off'})"
+}
+
+Integer kzDimOf(Integer full) {
+    Integer pct = Math.max(5, Math.min(100, (kzDimPercent ?: 30) as Integer))
+    return Math.max(5, Math.round((full * pct) / 100.0d) as Integer)
 }
 
 boolean pirRecent() {
@@ -1316,18 +1424,24 @@ def applyDayScene(Number fadeOverride = null) {
     def lrOccupied = livingRoomOccupied()
     Integer lrLevel = scaled(lrOccupied ? (dayHueLevel ?: 100) : 50)
     Integer hallwayLevel = scaled(dayHallwayLevel ?: 99)
+    Integer pendantLevel = scaled(dayKitchenPendantLevel ?: 100)
 
     // Dining Edisons step 50 / 75 / 100 with the factor
     Integer diningLevel = diningLevelFor(factor)
     boolean cansOn = cansWanted(factor)
+    state.kzFull = [hallway: hallwayLevel, pendant: pendantLevel, dining: diningLevel, cans: cansOn]
 
-    logDebug "Day scene: factor=${factor}%, fade=${fade}s, LR occupied=${lrOccupied}, lrLevel=${lrLevel}, diningLevel=${diningLevel}, cans=${cansOn}"
+    // Kitchen zone still quiet: keep it dimmed through this re-apply
+    boolean kzDim = state.kzDimmed && !kzActive()
+    if (kzDim) { hallwayLevel = kzDimOf(hallwayLevel); pendantLevel = kzDimOf(pendantLevel); diningLevel = (kzDiningDim ?: 30) as Integer; cansOn = false } else { state.kzDimmed = false }
+
+    logDebug "Day scene: factor=${factor}%, fade=${fade}s, LR occupied=${lrOccupied}, lrLevel=${lrLevel}, diningLevel=${diningLevel}, cans=${cansOn}, kzDim=${kzDim}"
 
     // Kitchen/Hallway zone
     setLevelSmooth(diningSwitch, diningLevel, fade)
     setLevelSmooth(hallwaySwitch, hallwayLevel, fade)
     applyCans(cansOn, fade)
-    setLevelSmooth(kitchenPendant, scaled(dayKitchenPendantLevel ?: 100), fade)
+    setLevelSmooth(kitchenPendant, pendantLevel, fade)
     
     // Living Room zone - only ceiling dims when unoccupied, bookcase stays constant
     setLevelSmooth(bookcaseGOLamp, scaled(dayBookcaseLevel ?: 50), fade)
@@ -1343,9 +1457,9 @@ def applyDayScene(Number fadeOverride = null) {
     activatorSwitch?.on()
     state.currentScene = "day"
     state.lastFactor = factor
-    rememberLevels([lr: lrLevel, hallway: hallwayLevel, dining: diningLevel])
+    rememberLevels([lr: lrLevel, hallway: state.kzFull.hallway, dining: state.kzFull.dining])
 
-    log.info "Day scene applied (factor ${factor}%, fade ${fade}s, LR ${lrOccupied ? 'occupied' : 'unoccupied'} ${lrLevel}%, dining ${diningLevel}%, cans ${cansOn ? 'on' : 'off'})"
+    log.info "Day scene applied (factor ${factor}%, fade ${fade}s${kzDim ? ', kitchen zone dimmed' : ''}, LR ${lrOccupied ? 'occupied' : 'unoccupied'} ${lrLevel}%, hallway ${hallwayLevel}%, dining ${diningLevel}%, cans ${cansOn ? 'on' : 'off'})"
     safeLogToSheet("scene", "Day", "factor ${factor}% LR ${lrLevel}% dining ${diningLevel}%", currentLux)
 }
 
@@ -1366,16 +1480,22 @@ def applyNightScene(Number fadeOverride = null) {
     boolean hold = rising && factor < 100 && roomIsOn() && (state.currentScene in ["day", "night"])
     Integer lrLevel = holdUp(scaled(lrOccupied ? lrFull : ((lrFull * 50 / 100) as Integer)), "lr", hold && lrOccupied)
     Integer hallwayLevel = holdUp(scaled(nightHallwayLevel ?: 80), "hallway", hold)
+    Integer pendantLevel = scaled(nightKitchenPendantLevel ?: 30)
     Integer diningLevel = holdUp(diningLevelFor(factor), "dining", hold)
     boolean cansOn = cansWanted(factor)
+    state.kzFull = [hallway: hallwayLevel, pendant: pendantLevel, dining: diningLevel, cans: cansOn]
 
-    logDebug "Night scene: factor=${factor}%, fade=${fade}s, hold=${hold}, LR occupied=${lrOccupied}, lrLevel=${lrLevel}, hallway=${hallwayLevel}, diningLevel=${diningLevel}, cans=${cansOn}"
+    // Kitchen zone still quiet: keep it dimmed through this re-apply
+    boolean kzDim = state.kzDimmed && !kzActive()
+    if (kzDim) { hallwayLevel = kzDimOf(hallwayLevel); pendantLevel = kzDimOf(pendantLevel); diningLevel = (kzDiningDim ?: 30) as Integer; cansOn = false } else { state.kzDimmed = false }
+
+    logDebug "Night scene: factor=${factor}%, fade=${fade}s, hold=${hold}, LR occupied=${lrOccupied}, lrLevel=${lrLevel}, hallway=${hallwayLevel}, diningLevel=${diningLevel}, cans=${cansOn}, kzDim=${kzDim}"
 
     // Kitchen/Hallway zone
     setLevelSmooth(diningSwitch, diningLevel, fade)
     setLevelSmooth(hallwaySwitch, hallwayLevel, fade)
     applyCans(cansOn, fade)
-    setLevelSmooth(kitchenPendant, scaled(nightKitchenPendantLevel ?: 30), fade)
+    setLevelSmooth(kitchenPendant, pendantLevel, fade)
     
     // Living Room zone - only ceiling dims when unoccupied, bookcase stays constant
     setLevelSmooth(bookcaseGOLamp, scaled(nightBookcaseLevel ?: 15), fade)
@@ -1391,9 +1511,9 @@ def applyNightScene(Number fadeOverride = null) {
     activatorSwitch?.on()
     state.currentScene = "night"
     state.lastFactor = factor
-    rememberLevels([lr: lrLevel, hallway: hallwayLevel, dining: diningLevel])
+    rememberLevels([lr: lrLevel, hallway: state.kzFull.hallway, dining: state.kzFull.dining])
 
-    log.info "Night scene applied (factor ${factor}%, fade ${fade}s${hold ? ', hold' : ''}, LR ${lrOccupied ? 'occupied' : 'unoccupied'} ${lrLevel}%, hallway ${hallwayLevel}%, dining ${diningLevel}%, cans ${cansOn ? 'on' : 'off'})"
+    log.info "Night scene applied (factor ${factor}%, fade ${fade}s${hold ? ', hold' : ''}${kzDim ? ', kitchen zone dimmed' : ''}, LR ${lrOccupied ? 'occupied' : 'unoccupied'} ${lrLevel}%, hallway ${hallwayLevel}%, dining ${diningLevel}%, cans ${cansOn ? 'on' : 'off'})"
     safeLogToSheet("scene", "Night", "factor ${factor}% LR ${lrLevel}% dining ${diningLevel}%", currentLux)
 }
 
@@ -1418,6 +1538,7 @@ def applyPredawnScene() {
     setLevelSmooth(bookcaseColorLamp, predawnBookcaseLevel ?: 10, fade)
     setLevelSmooth(lrHueLights, lrLevel, fade)
     state.currentScene = "predawn"
+    state.kzDimmed = false
 
     // Extra warm color temp for early morning
     if (lrHueLights?.hasCommand("setColorTemperature")) {
@@ -1451,6 +1572,7 @@ def applyWindDownScene() {
     setLevelSmooth(bookcaseColorLamp, windDownBookcaseLevel ?: 10, fade)
     setLevelSmooth(lrHueLights, lrLevel, fade)
     state.currentScene = "winddown"
+    state.kzDimmed = false
 
     // Warm color temp for the late evening
     if (lrHueLights?.hasCommand("setColorTemperature")) {
@@ -1487,6 +1609,7 @@ def applyTvScene() {
     
     activatorSwitch?.off()
     state.currentScene = "tv"
+    state.kzDimmed = false
     
     logDebug "TV Time scene applied"
     log.info "TV Time scene applied"
@@ -1521,6 +1644,8 @@ def turnAllLightsOff() {
     state.factorFloor = null     // the dark-room floor lasts only while the room is lit
     state.lastLevels = null      // nothing to hold against once everything is off
     state.lastFactor = null
+    state.kzDimmed = false
+    unschedule("kzDimCheck")
     
     log.info "All lights turned off"
     safeLogToSheet("scene", "Off", "all lights off", currentLux)
