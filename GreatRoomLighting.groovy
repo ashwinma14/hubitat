@@ -6,6 +6,9 @@
  *
  *  Author: Claude (for Ashwin)
  *  Date: 2026-02-12
+ *  Version: 1.36 - mornings dim as gradually as dusks brighten: the ambient factor steps down one band at a time,
+ *                  the hold-up only applies while the factor is rising, a mode change on a lit room fades over the
+ *                  ambient fade, and the kitchen cans wait for a 75% factor instead of the dark-room floor
  *  Version: 1.35 - living-room PIR as a second opinion for zone dimming: the ceiling never dims while the PIR
  *                  has seen motion in the last few minutes, and PIR motion re-brightens a ceiling the mmWave dimmed
  *  Version: 1.34 - kitchen cans also come on whenever the room itself measured dark (not only once outdoor
@@ -35,7 +38,7 @@ preferences {
     page(name: "mainPage")
 }
 
-def appVersion() { return "1.35" }
+def appVersion() { return "1.36" }
 
 def mainPage() {
     dynamicPage(name: "mainPage", title: "Great Room Lighting Controller", install: true, uninstall: true) {
@@ -120,7 +123,7 @@ def mainPage() {
             input "adaptiveLux55", "number", title: "Outdoor lux below which levels run at 55%", defaultValue: 400, required: true, width: 4
             input "adaptiveLux75", "number", title: "Outdoor lux below which levels run at 75%", defaultValue: 150, required: true, width: 4
             input "adaptiveLux100", "number", title: "Outdoor lux below which levels run at 100%", defaultValue: 50, required: true, width: 4
-            input "cansLuxThreshold", "number", title: "Kitchen cans only when outdoor lux is below", defaultValue: 150, required: true, width: 6
+            input "cansFactor", "number", title: "Kitchen cans (on/off only) join once the factor reaches this percent", defaultValue: 75, required: true, width: 6
             input "ambientStepMinutes", "number", title: "Minimum minutes between ambient steps", defaultValue: 10, required: true, width: 6
             input "turnOnFadeSeconds", "number", title: "Fade-in when the room turns on (seconds)", defaultValue: 60, required: true, width: 4
             input "ambientFadeSeconds", "number", title: "Fade for ambient steps (seconds)", defaultValue: 45, required: true, width: 4
@@ -131,7 +134,7 @@ def mainPage() {
             input "duskLuxThreshold", "number", title: "...but once outdoor lux is below this, use the shorter dusk debounce", defaultValue: 1000, required: true, width: 4
             input "duskDebounceMinutes", "number", title: "Dusk debounce (minutes)", defaultValue: 3, required: true, width: 4
             input "darkRoomMinFactor", "number", title: "When the room turned on because it measured dark, never run below this factor (%) until it turns off", defaultValue: 55, required: true
-            paragraph "Dining runs 50% / 75% / 100% as the factor reaches 55 / 75 / 100. On the Evening/Night mode change the living room, hallway and dining never step down while dusk is still ramping."
+            paragraph "Dining runs 50% / 75% / 100% as the factor reaches 55 / 75 / 100. While the factor is rising (dusk, morning ramp) the living room, hallway and dining never step down; when it is falling (a brightening morning) it steps down one band at a time, at most one step per the interval above."
             paragraph adaptiveStatus()
         }
 
@@ -948,7 +951,9 @@ def modeHandler(evt) {
 
     // Always re-evaluate when mode changes (this is now our primary trigger)
     if (wasNeeded != state.lightNeeded || state.presenceActive) {
+        state.modeChangeFade = roomIsOn()
         evaluateLighting("mode changed to ${evt.value}")
+        state.modeChangeFade = false
     }
 }
 
@@ -1097,7 +1102,7 @@ Integer ambientFactor(boolean commit = true) {
     Integer down = bandFactor(lux, 1.4)
     Integer target = last
     if (up > last) target = up
-    else if (down < last) target = down
+    else if (down < last) target = Math.max(down, nextBandDown(last))   // brightening: one band per step, never a plunge
     if (target == last || !commit) return commit ? last : target
     long since = now() - ((state.ambientChangedAt ?: 0) as Long)
     long minMs = ((ambientStepMinutes ?: 10) as Long) * 60000L
@@ -1109,6 +1114,13 @@ Integer ambientFactor(boolean commit = true) {
     state.ambientChangedAt = now()
     log.info "Ambient factor ${last}% -> ${target}% (outdoor ${lux} lux)"
     return target
+}
+
+/** The band just below the given factor (100 -> 75 -> 55 -> 35). */
+Integer nextBandDown(Integer factor) {
+    if (factor > 75) return 75
+    if (factor > 55) return 55
+    return 35
 }
 
 /** Morning ramp: 30% of scene levels when predawn ends, rising to 100% over morningRampMinutes. 100 when no ramp is running. */
@@ -1134,9 +1146,9 @@ Integer diningLevelFor(Integer factor) {
     return 50
 }
 
-/** During dusk (factor still below 100) a main light never steps down from its last commanded level. */
-Integer holdUp(Integer target, String key, boolean dusk) {
-    if (!dusk) return target
+/** While the factor is rising (dusk, morning ramp) a main light never steps down from its last commanded level. */
+Integer holdUp(Integer target, String key, boolean hold) {
+    if (!hold) return target
     Integer last = ((state.lastLevels ?: [:])[key] ?: 0) as Integer
     return Math.max(target, last)
 }
@@ -1155,17 +1167,11 @@ Integer scaled(Number base) {
     return Math.min(100, Math.max(Math.min(10, b), v))
 }
 
-/**
- * The cans are on/off only. At an ordinary dusk the dimmable lights carry the first steps and the cans join once
- * outdoor light is under cansLuxThreshold. When the room itself measured dark (factor floor set) they are wanted
- * right away: that reading is the direct evidence that the overhead light is needed.
- */
-boolean cansWanted() {
+/** The cans are on/off only, so they join once the effective factor reaches cansFactor (default 75%) and drop out below it. */
+boolean cansWanted(Integer factor) {
     if (adaptiveEnabled == false) return true
-    if (state.factorFloor) return true
-    def lux = outdoorLuxSensor?.currentIlluminance
-    if (lux == null) return true
-    return lux < (cansLuxThreshold ?: 150)
+    if (factor == null) return true
+    return factor >= ((cansFactor ?: 75) as Integer)
 }
 
 def setCans(boolean on) {
@@ -1189,7 +1195,7 @@ def applyCans(boolean on, Integer fade) {
 def cansOnDelayed() {
     if (!(state.currentScene in ["day", "night"]) || !roomIsOn()) return
     if (state.manualOverride || state.tvTimeActive) return
-    if (cansWanted()) setCans(true)
+    if (cansWanted((state.lastFactor ?: 100) as Integer)) setCans(true)
 }
 
 boolean roomIsOn() {
@@ -1204,6 +1210,11 @@ Integer sceneFade(Number override) {
         state.ambientFactor = rawAmbientFactor()
         state.ambientChangedAt = now()
         return (turnOnFadeSeconds ?: 60) as Integer
+    }
+    if (state.modeChangeFade) {
+        // A mode change re-applies a scene with different bases: take the slow fade, not the 3-second one
+        state.modeChangeFade = false
+        return (ambientFadeSeconds ?: 45) as Integer
     }
     return (sceneFadeSeconds ?: 3) as Integer
 }
@@ -1280,7 +1291,7 @@ String adaptiveStatus() {
     String floor = state.factorFloor ? ", dark-room floor ${state.factorFloor}%" : ""
     return "Outdoor ${lux != null ? lux + ' lux' : 'sensor missing'}: band ${rawAmbientFactor()}%, applied factor ${state.ambientFactor ?: '-'}%${floor}; " +
            "${ramp}; predawn ends ${predawnAt} today; scene now: ${state.currentScene ?: 'off'}; " +
-           "cans ${cansWanted() ? 'allowed' : 'held off'} (outdoor under ${cansLuxThreshold ?: 150} lux, or the room measured dark)"
+           "cans ${cansWanted((state.lastFactor ?: state.ambientFactor ?: 100) as Integer) ? 'allowed' : 'held off'} (from a ${cansFactor ?: 75}% factor)"
 }
 
 // ==================== SCENE ACTIONS ====================
@@ -1303,7 +1314,7 @@ def applyDayScene(Number fadeOverride = null) {
 
     // Dining Edisons step 50 / 75 / 100 with the factor
     Integer diningLevel = diningLevelFor(factor)
-    boolean cansOn = cansWanted()
+    boolean cansOn = cansWanted(factor)
 
     logDebug "Day scene: factor=${factor}%, fade=${fade}s, LR occupied=${lrOccupied}, lrLevel=${lrLevel}, diningLevel=${diningLevel}, cans=${cansOn}"
 
@@ -1326,6 +1337,7 @@ def applyDayScene(Number fadeOverride = null) {
     
     activatorSwitch?.on()
     state.currentScene = "day"
+    state.lastFactor = factor
     rememberLevels([lr: lrLevel, hallway: hallwayLevel, dining: diningLevel])
 
     log.info "Day scene applied (factor ${factor}%, fade ${fade}s, LR ${lrOccupied ? 'occupied' : 'unoccupied'} ${lrLevel}%, dining ${diningLevel}%, cans ${cansOn ? 'on' : 'off'})"
@@ -1342,15 +1354,17 @@ def applyNightScene(Number fadeOverride = null) {
     def lrOccupied = livingRoomOccupied()
     def lrFull = nightHueLevel ?: 80
 
-    // Dusk hold: while the factor is still climbing and the room was already lit by the day/night scene,
-    // the main lights never step down (the night bases are lower than the day bases, so the mode change used to dip them)
-    boolean dusk = factor < 100 && roomIsOn() && (state.currentScene in ["day", "night"])
-    Integer lrLevel = holdUp(scaled(lrOccupied ? lrFull : ((lrFull * 50 / 100) as Integer)), "lr", dusk && lrOccupied)
-    Integer hallwayLevel = holdUp(scaled(nightHallwayLevel ?: 80), "hallway", dusk)
-    Integer diningLevel = holdUp(diningLevelFor(factor), "dining", dusk)
-    boolean cansOn = cansWanted()
+    // Hold-up: while the factor is rising (dusk, morning ramp) and the room was already lit by the day/night scene,
+    // the main lights never step down (the night bases are lower than the day bases, so the mode change used to dip them).
+    // A falling factor (brightening morning) is allowed through: that is the one-band-at-a-time step-down.
+    boolean rising = factor >= ((state.lastFactor ?: factor) as Integer)
+    boolean hold = rising && factor < 100 && roomIsOn() && (state.currentScene in ["day", "night"])
+    Integer lrLevel = holdUp(scaled(lrOccupied ? lrFull : ((lrFull * 50 / 100) as Integer)), "lr", hold && lrOccupied)
+    Integer hallwayLevel = holdUp(scaled(nightHallwayLevel ?: 80), "hallway", hold)
+    Integer diningLevel = holdUp(diningLevelFor(factor), "dining", hold)
+    boolean cansOn = cansWanted(factor)
 
-    logDebug "Night scene: factor=${factor}%, fade=${fade}s, dusk hold=${dusk}, LR occupied=${lrOccupied}, lrLevel=${lrLevel}, hallway=${hallwayLevel}, diningLevel=${diningLevel}, cans=${cansOn}"
+    logDebug "Night scene: factor=${factor}%, fade=${fade}s, hold=${hold}, LR occupied=${lrOccupied}, lrLevel=${lrLevel}, hallway=${hallwayLevel}, diningLevel=${diningLevel}, cans=${cansOn}"
 
     // Kitchen/Hallway zone
     setLevelSmooth(diningSwitch, diningLevel, fade)
@@ -1371,9 +1385,10 @@ def applyNightScene(Number fadeOverride = null) {
     
     activatorSwitch?.on()
     state.currentScene = "night"
+    state.lastFactor = factor
     rememberLevels([lr: lrLevel, hallway: hallwayLevel, dining: diningLevel])
 
-    log.info "Night scene applied (factor ${factor}%, fade ${fade}s${dusk ? ', dusk hold' : ''}, LR ${lrOccupied ? 'occupied' : 'unoccupied'} ${lrLevel}%, hallway ${hallwayLevel}%, dining ${diningLevel}%, cans ${cansOn ? 'on' : 'off'})"
+    log.info "Night scene applied (factor ${factor}%, fade ${fade}s${hold ? ', hold' : ''}, LR ${lrOccupied ? 'occupied' : 'unoccupied'} ${lrLevel}%, hallway ${hallwayLevel}%, dining ${diningLevel}%, cans ${cansOn ? 'on' : 'off'})"
     safeLogToSheet("scene", "Night", "factor ${factor}% LR ${lrLevel}% dining ${diningLevel}%", currentLux)
 }
 
@@ -1500,6 +1515,7 @@ def turnAllLightsOff() {
     state.currentScene = "off"
     state.factorFloor = null     // the dark-room floor lasts only while the room is lit
     state.lastLevels = null      // nothing to hold against once everything is off
+    state.lastFactor = null
     
     log.info "All lights turned off"
     safeLogToSheet("scene", "Off", "all lights off", currentLux)
