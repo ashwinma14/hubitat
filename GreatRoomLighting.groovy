@@ -307,8 +307,12 @@ def initialize() {
     armPredawnEnd()
 
     // Adaptive brightness bookkeeping
-    state.ambientFactor = rawAmbientFactor()
-    state.ambientChangedAt = now()
+    // Start from the current band when the room is off; a lit room keeps its committed factor so an app update
+    // never steps the lights (the one-band, rate-limited logic moves them)
+    if (!roomIsOn() || state.ambientFactor == null) {
+        state.ambientFactor = rawAmbientFactor()
+        state.ambientChangedAt = now()
+    }
     // Keep a morning ramp that is still running across an app update; otherwise a deploy mid-ramp jumps the room to 100%
     if (state.morningRamp && rampFactor() < 100) {
         runIn(180, "morningRampStep")
