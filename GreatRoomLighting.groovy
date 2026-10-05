@@ -6,6 +6,9 @@
  *
  *  Author: Claude (for Ashwin)
  *  Date: 2026-02-12
+ *  Version: 1.38 - mornings use the day scene's levels: Night mode lasts until outdoor light reaches 300 lux, so
+ *                  the morning ramp used to climb toward the evening's mood levels (pendant 30%, hallway 80%)
+ *                  instead of the day's (pendant 100%, hallway 99%); from predawn end until noon the day scene applies
  *  Version: 1.37 - two zones: the living room is a dead end, so it counts as occupied until something outside it
  *                  moves after it last did (sitting still no longer times the house out); the kitchen/dining/hallway
  *                  zone dims to a low level after a few quiet minutes while the room is on and restores on motion
@@ -41,7 +44,7 @@ preferences {
     page(name: "mainPage")
 }
 
-def appVersion() { return "1.37" }
+def appVersion() { return "1.38" }
 
 def mainPage() {
     dynamicPage(name: "mainPage", title: "Great Room Lighting Controller", install: true, uninstall: true) {
@@ -362,7 +365,7 @@ def delayedInitialEvaluation() {
     if (state.presenceActive && state.lightNeeded && !state.manualOverride && !state.tvTimeActive) {
         log.info "Conditions warrant lights on - applying scene"
         if (location.mode == "Night") {
-            if (isPredawn()) { applyPredawnScene() } else if (isWindDown()) { applyWindDownScene() } else { applyNightScene() }
+            if (isPredawn()) { applyPredawnScene() } else if (isWindDown()) { applyWindDownScene() } else if (isMorning()) { applyDayScene() } else { applyNightScene() }
         } else {
             applyDayScene()
         }
@@ -451,6 +454,13 @@ def getDiningLevelForAmbient() {
     
     logDebug "Dining ambient level: outdoorLux=${outdoorLux} -> ${level}%"
     return level
+}
+
+/** Morning: past today's predawn end and before noon. Night mode lasts until the outdoor sensor reads 300 lux, which can be mid-morning in winter, so the mode alone cannot tell morning from evening. */
+boolean isMorning() {
+    def cal = java.util.Calendar.getInstance(location.timeZone)
+    Integer nowMins = cal.get(java.util.Calendar.HOUR_OF_DAY) * 60 + cal.get(java.util.Calendar.MINUTE)
+    return nowMins >= predawnEndMinutes() && nowMins < 12 * 60
 }
 
 def isPredawn() {
@@ -1031,7 +1041,7 @@ def applyLrDimmed() {
 
 def applyLrZoneLevel(Boolean occupied) {
     // Zone dimming touches ONLY the LR ceiling - other lights keep their scene levels
-    def isNightish = (location.mode == "Night" || location.mode == "Evening")
+    def isNightish = (location.mode == "Night" || location.mode == "Evening") && !(location.mode == "Night" && isMorning() && !isPredawn())
     def fullLevel = isNightish ? (isPredawn() ? (predawnHueLevel ?: 30) : (isWindDown() ? (windDownHueLevel ?: 50) : (nightHueLevel ?: 80))) : (dayHueLevel ?: 100)
     def lrLevel = scaled(occupied ? fullLevel : ((fullLevel * 50 / 100) as Integer))
     if (occupied) {
@@ -1165,6 +1175,9 @@ def evaluateLighting(String reason) {
         } else if (isWindDown()) {
             logDebug "Night mode (wind-down) - applying wind-down scene"
             applyWindDownScene()
+        } else if (isMorning()) {
+            logDebug "Night mode (morning) - applying day scene"
+            applyDayScene()
         } else {
             logDebug "Night mode - applying night scene"
             applyNightScene()
