@@ -17,8 +17,9 @@
  *  Date: 2026-09-29
  *  Version: 1.8 - single bulbs: a two-color pattern paints a whole bulb one of its colors (first/second, chosen per bulb),
  *                 so two pathway bulbs can be purple and orange next to the alternating deck lights; "self-powered"
- *                 lights (own photocell or wall switch, so no plug event) are re-sent every few minutes while the plugs
- *                 are on until the driver confirms the look (cloudAPI=Success for colors, effectNum for scenes)
+ *                 lights (own sunset timer, photocell or wall switch, so no plug event) get a burst of sends right after
+ *                 the hub's sunset and are re-sent every few minutes while the plugs are on until the driver confirms the
+ *                 look (cloudAPI=Success for colors, effectNum for scenes); nothing is sent to them before sunset
  *  Version: 1.7 - a window's scene may be a two-color bulb pattern: 'alt:#8B00FF/#FF5500' paints even/odd bulbs on any
  *                 light with segment control, so the deck lights can alternate purple and orange while the bulb string
  *                 shows a DIY scene ('GH-iVIOcJ | alt:#8B00FF/#FF5500': each light takes the first look it can do)
@@ -69,6 +70,10 @@ def mainPage() {
             if (selfPoweredLights()) {
                 input "selfRetryMinutes", "number", title: "Self-powered lights: minutes between re-sends while unconfirmed", defaultValue: 5, required: true, width: 6
                 input "selfRetryHours", "number", title: "Self-powered lights: stop re-sending this many hours after the plugs turn on", defaultValue: 6, required: true, width: 6
+                input "selfSunset", "bool", title: "Self-powered lights are on a sunset timer: nothing is sent before the hub's sunset, then a burst of sends right after it (the loop above is the fallback)", defaultValue: true, submitOnChange: true, width: 6
+                if (selfSunset != false) {
+                    input "selfSunsetOffset", "number", title: "Minutes after the hub's sunset (${sunsetText()}) for the first send; the burst repeats +2 and +5 min later", defaultValue: 1, required: true, width: 6
+                }
             }
         }
 
@@ -165,6 +170,9 @@ def initialize() {
     subscribe(powerSwitches, "switch.off", "powerOffHandler")
     if (gameSwitch) {
         subscribe(gameSwitch, "switch", "gameHandler")
+    }
+    if (selfPoweredLights() && selfSunset != false) {
+        subscribe(location, "sunset", "sunsetHandler")
     }
 
     // Re-evaluate shortly after midnight so a window boundary takes effect while the lights are on
@@ -665,7 +673,15 @@ def armSelfRetry() {
         log.info "Still unconfirmed ${selfRetryHours ?: 6} h after the plugs turned on: ${pending*.displayName.join(', ')}; no more re-sends until the next power-on"
         return
     }
+    // On a sunset timer the lights have no power before sunset, so the first re-send waits for it (the sunset burst sends too)
+    long notBefore = selfNotBefore()
+    if (now() < notBefore) {
+        runOnce(new Date(notBefore + 30000L), "retrySelfPowered")
+        logDebug "Waiting for sunset before re-sending to ${pending*.displayName.join(', ')}"
+        return
+    }
     int mins = Math.max(1, (selfRetryMinutes ?: 5) as Integer)
+    if (((state.selfRetryCount ?: 0) as Integer) >= 12) mins = Math.max(mins, 15)   // an hour of misses: the lights are not coming; slow down
     runIn(mins * 60, "retrySelfPowered")
     logDebug "Re-sending to ${pending*.displayName.join(', ')} in ${mins} min"
 }
@@ -676,6 +692,40 @@ def retrySelfPowered() {
     if (!pending) return
     state.selfRetryCount = ((state.selfRetryCount ?: 0) as Integer) + 1
     applyScenes([reason: "self-powered re-send", attempt: "r${state.selfRetryCount}", devices: pending*.id.collect { it.toString() }])
+}
+
+/** Sunset (the location event): send to the self-powered lights at +offset, +offset+2 and +offset+5 minutes; a miss falls back to the loop. */
+def sunsetHandler(evt) {
+    if (appPaused || !selfPoweredLights()) return
+    int off = Math.max(0, (selfSunsetOffset ?: 1) as Integer) * 60
+    [0, 120, 300].each { runIn(off + it, "sunsetSend", [overwrite: false]) }
+    logDebug "Sunset: self-powered sends at +${off}s, +${off + 120}s and +${off + 300}s"
+}
+
+def sunsetSend() {
+    retrySelfPowered()
+}
+
+/** Earliest moment a self-powered re-send makes sense today: sunset + offset on a sunset timer, otherwise now. */
+long selfNotBefore() {
+    if (selfSunset == false) return 0L
+    long sunset = sunsetMillis()
+    if (!sunset) return 0L
+    return sunset + Math.max(0, (selfSunsetOffset ?: 1) as Integer) * 60000L
+}
+
+long sunsetMillis() {
+    try {
+        return location.sunset?.time ?: 0L
+    } catch (e) {
+        log.warn "Could not read the hub's sunset time (${e.message}); self-powered re-sends will not wait for sunset"
+        return 0L
+    }
+}
+
+String sunsetText() {
+    long s = sunsetMillis()
+    return s ? new Date(s).format("h:mm a", location.timeZone) + " today" : "unknown"
 }
 
 /** The scene that should be showing right now: game override, then the active date window, then the default. */
@@ -772,7 +822,17 @@ String statusHtml() {
         if (settings["selfPowered_${dev.id}".toString()]) {
             Map cur = game ? gameLook(dev) : resolveLook(dev, target)
             boolean ok = cur != null && confirmedLooks[dev.id.toString()] == lookKey(cur)
-            sb << "&nbsp;&nbsp;Self-powered: ${ok ? 'current look confirmed by the driver' : 'not confirmed yet (re-sent every ' + (selfRetryMinutes ?: 5) + ' min while the plugs are on, up to ' + (selfRetryHours ?: 6) + ' h after power-on)'}<br/>"
+            String plan
+            if (ok) {
+                plan = "current look confirmed by the driver"
+            } else if (!anyPowerOn()) {
+                plan = "not confirmed; sends start when the plugs turn on"
+            } else if (now() < selfNotBefore()) {
+                plan = "not confirmed; waiting for sunset (${sunsetText()}, first send ${selfSunsetOffset ?: 1} min after)"
+            } else {
+                plan = "not confirmed yet (re-sent every ${selfRetryMinutes ?: 5} min while the plugs are on, up to ${selfRetryHours ?: 6} h after power-on)"
+            }
+            sb << "&nbsp;&nbsp;Self-powered: ${plan}<br/>"
         }
         windows().findAll { it.scene }.each { win ->
             sb << "&nbsp;&nbsp;${win.name}: '${win.scene}' &rarr; ${lookText(dev, win.scene)}<br/>"
