@@ -375,6 +375,14 @@ def delayedInitialEvaluation() {
         } else {
             applyDayScene()
         }
+    } else if (roomIsOn() && !state.presenceActive && !state.manualOverride && !state.tvTimeActive) {
+        // The zone is already quiet and the room is lit: the update cancelled the running presence timeout, so restart it
+        // (otherwise the room stays lit until the next motion event, 2026-10-06)
+        state.presenceActive = true
+        state.pendingPresenceOff = true
+        Integer mins = (presenceTimeout ?: 8) as Integer
+        log.info "Room is lit but the motion zone is quiet - presence timeout restarted (${mins} minutes)"
+        runIn(mins * 60, presenceTimedOut)
     } else {
         log.info "Waiting for events (motion, mode changes, etc.) to take action..."
         brightRoomSafetyNet()
