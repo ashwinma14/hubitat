@@ -50,9 +50,10 @@ Hubitat connector:
 ## Govee Holiday Scenes (app 590)
 
 Lights: string lights 433 and deck lights 434 (powered by the Twinkle/Front Lights plugs),
-pathway bulbs 436 and 437 (Govee H600A, own power: no plug event, so they are marked
-"self-powered" and re-sent every 5 min while the plugs are on until the driver reports
-`cloudAPI=Success`). A two-color spec such as `alt:#8B00FF/#FF5500` alternates bulbs on the
+pathway bulbs 436 and 437 (Govee H600A on a non-smart sunset timer: no plug event, so they
+are marked "self-powered": nothing is sent before the hub's sunset, a burst goes out at
+sunset +1/+3/+6 min, and they are re-sent every 5 min while the plugs are on until the
+driver reports `cloudAPI=Success`). A two-color spec such as `alt:#8B00FF/#FF5500` alternates bulbs on the
 deck lights and paints a single bulb one color (436 = first color, 437 = second).
 Game days override everything with the Seahawks colors the same way.
 
