@@ -15,6 +15,10 @@
  *
  *  Author: Claude (for Ashwin)
  *  Date: 2026-09-29
+ *  Version: 1.8 - single bulbs: a two-color pattern paints a whole bulb one of its colors (first/second, chosen per bulb),
+ *                 so two pathway bulbs can be purple and orange next to the alternating deck lights; "self-powered"
+ *                 lights (own photocell or wall switch, so no plug event) are re-sent every few minutes while the plugs
+ *                 are on until the driver confirms the look (cloudAPI=Success for colors, effectNum for scenes)
  *  Version: 1.7 - a window's scene may be a two-color bulb pattern: 'alt:#8B00FF/#FF5500' paints even/odd bulbs on any
  *                 light with segment control, so the deck lights can alternate purple and orange while the bulb string
  *                 shows a DIY scene ('GH-iVIOcJ | alt:#8B00FF/#FF5500': each light takes the first look it can do)
@@ -44,7 +48,7 @@ preferences {
     page(name: "mainPage")
 }
 
-def appVersion() { return "1.7" }
+def appVersion() { return "1.8" }
 
 def mainPage() {
     dynamicPage(name: "mainPage", title: "Govee Holiday Scenes v${appVersion()}", install: true, uninstall: true) {
@@ -52,16 +56,26 @@ def mainPage() {
         section("<b>Lights</b>") {
             input "goveeLights", "capability.lightEffects", title: "Govee lights (Govee v2 driver)", multiple: true, required: true, submitOnChange: true
             goveeLights?.each { dev ->
-                input "segCount_${dev.id}".toString(), "number", title: "${dev.displayName}: bulbs/segments (used by the alternate-colors pattern)", defaultValue: 15, required: false, width: 6
+                if (dev.hasCommand("segmentedColorRgb")) {
+                    input "segCount_${dev.id}".toString(), "number", title: "${dev.displayName}: bulbs/segments (used by the alternate-colors pattern)", defaultValue: 15, required: false, width: 6
+                } else {
+                    input "altSlot_${dev.id}".toString(), "enum", title: "${dev.displayName}: single bulb, so a two-color pattern paints it one color", options: ["A": "the first color", "B": "the second color"], defaultValue: defaultSlot(dev), required: false, width: 6
+                }
+                input "selfPowered_${dev.id}".toString(), "bool", title: "${dev.displayName}: has its own power (photocell or wall switch, not one of the plugs below), so keep re-sending its look while the plugs are on until the driver confirms it", defaultValue: false, width: 6
             }
             input "powerSwitches", "capability.switch", title: "Plugs/switches that power these lights", multiple: true, required: true, submitOnChange: true
             input "bootDelay", "number", title: "Seconds after power-on before the first scene command", defaultValue: 45, required: true
             input "applyAttempts", "number", title: "How many times to send the scene after power-on (1-4; re-sends at +75s, +255s and +15 min for slow Wi-Fi rejoins)", defaultValue: 4, required: true
+            if (selfPoweredLights()) {
+                input "selfRetryMinutes", "number", title: "Self-powered lights: minutes between re-sends while unconfirmed", defaultValue: 5, required: true, width: 6
+                input "selfRetryHours", "number", title: "Self-powered lights: stop re-sending this many hours after the plugs turn on", defaultValue: 6, required: true, width: 6
+            }
         }
 
         section("<b>Scenes</b>") {
             paragraph "Scene names must match the light's scene catalog (see Status below). Give alternatives separated by | and each light uses the first one it can do, e.g. 'Static warm white | White Light'. " +
-                      "An alternative may also be a two-color bulb pattern, 'alt:#8B00FF/#FF5500' (even bulbs the first color, odd bulbs the second), which any light with per-bulb control can show without a DIY scene. " +
+                      "An alternative may also be a two-color bulb pattern, 'alt:#8B00FF/#FF5500' (even bulbs the first color, odd bulbs the second), which any light with per-bulb control can show without a DIY scene; " +
+                      "a single bulb shows one of the two colors (chosen per bulb in the Lights section). " +
                       "Windows are MM-DD and may wrap the year end (e.g. 11-27 to 01-06)."
             input "defaultScene", "text", title: "Default scene outside any window", defaultValue: "Static warm white", required: true, submitOnChange: true
             input "halloweenEnabled", "bool", title: "Halloween window", defaultValue: true, submitOnChange: true
@@ -96,9 +110,9 @@ def mainPage() {
             input "gameSwitch", "capability.switch", title: "Also treat this switch being on as game time (optional, e.g. a calendar-driven Seahawks_Game switch)", required: false, submitOnChange: true
             if (gameSwitch || scheduleEnabled) {
                 input "gamePattern", "enum", title: "Game-day look", required: true, defaultValue: "scene", submitOnChange: true,
-                    options: ["scene": "A scene by name (built-in or DIY)", "alternate": "Alternate two colors bulb by bulb (no DIY needed; per-segment lights only)", "auto": "The scene where a light has it, the alternate-colors pattern elsewhere"]
+                    options: ["scene": "A scene by name (built-in or DIY)", "alternate": "Alternate two colors bulb by bulb (no DIY needed; a single bulb takes one of the two colors)", "auto": "The scene where a light has it, the alternate-colors pattern elsewhere"]
                 if (gamePattern in ["alternate", "auto"]) {
-                    paragraph "Bulbs are painted even/odd with the two colors below (counts per light are set in the Lights section). The Govee driver cannot confirm segment commands and logs a spurious 'command failed' line for them even when they work, so check the lights."
+                    paragraph "Bulbs are painted even/odd with the two colors below (counts per light are set in the Lights section); a single bulb shows the color chosen for it there. The Govee driver cannot confirm segment commands and logs a spurious 'command failed' line for them even when they work, so check the lights."
                     input "gameColorA", "text", title: "Color A (hex, e.g. #69BE28)", defaultValue: "#69BE28", required: true, width: 6
                     input "gameColorB", "text", title: "Color B (hex, e.g. #0055FF)", defaultValue: "#0055FF", required: true, width: 6
                     input "gameFirstBulb", "number", title: "Index of the first bulb (0 for Govee's API; try 1 if the pattern looks shifted)", defaultValue: 0, required: true
@@ -168,7 +182,16 @@ def initialize() {
         }
     }
 
+    // Resume the self-powered re-send loop if the lights are on right now (a code update mid-evening must not drop it)
+    if (state.confirmedLooks == null) state.confirmedLooks = [:]
+    if (selfPoweredLights() && anyPowerOn()) {
+        state.retryStartedAt = now()
+        runIn(30, "retrySelfPowered")
+    }
+
+    def selfPowered = selfPoweredLights()
     log.info "Lights: ${goveeLights*.displayName.join(', ')} | Power: ${powerSwitches*.displayName.join(', ')} | " +
+             "Self-powered: ${selfPowered ? selfPowered*.displayName.join(', ') : 'none'} | " +
              "Game switch: ${gameSwitch?.displayName ?: 'none'} | Today's scene: '${targetSceneName()}' | paused=${appPaused}"
 }
 
@@ -192,7 +215,11 @@ def powerOnHandler(evt) {
         return
     }
     unschedule("applyScenes")
+    unschedule("retrySelfPowered")
     state.powerOnAt = now()
+    state.retryStartedAt = now()
+    state.selfRetryCount = 0
+    state.confirmedLooks = [:]   // everything rebooted (or may have); each light is confirmed again by its next send
 
     Integer delay = Math.max(5, (bootDelay ?: 45) as Integer)
     Integer attempts = Math.min(4, Math.max(1, (applyAttempts ?: 4) as Integer))
@@ -206,6 +233,9 @@ def powerOffHandler(evt) {
     logDebug "Power off: ${evt.displayName}"
     if (!anyPowerOn()) {
         unschedule("applyScenes")
+        unschedule("retrySelfPowered")
+        state.confirmedLooks = [:]
+        state.retryStartedAt = null
         logDebug "All power switches off; cancelled pending scene sends"
         if (state.gameWindowActive && gameAllNight != false && now() >= ((state.gameMinEnd ?: 0) as Long)) {
             endGameWindow(false)
@@ -228,6 +258,7 @@ def dailyRollover() {
     def target = targetSceneName()
     if (target == state.lastApplied?.scene) { logDebug "Rollover: scene unchanged ('${target}')"; return }
     log.info "Date rollover: switching to '${target}'"
+    state.retryStartedAt = now()
     runIn(2, "applyScenes", [data: [reason: "date rollover", attempt: 1], overwrite: false])
     runIn(62, "applyScenes", [data: [reason: "date rollover", attempt: 2], overwrite: false])
 }
@@ -249,51 +280,43 @@ def appButtonHandler(String btn) {
 
 // ==================== SCENE LOGIC ====================
 
+/** Send every light (or data.devices only) its current look: the game-day look when a game is on, else the active window's scene. */
 def applyScenes(data) {
     if (appPaused) { logDebug "Paused; not applying"; return }
     String reason = data?.reason ?: "manual"
     def attempt = data?.attempt ?: 1
-    if (gameActive() && gamePattern in ["alternate", "auto"]) {
-        applyAlternate(reason, attempt)
-        return
-    }
+    List only = data?.devices ? data.devices.collect { it.toString() } : null
+    def lights = only ? goveeLights.findAll { it.id.toString() in only } : goveeLights
+    boolean game = gameActive() && gamePattern in ["alternate", "auto"]
     String target = targetSceneName()
-    def applied = []
-    def painted = []
+    def sent = []
     def missing = []
 
-    goveeLights.each { dev ->
-        Map look = resolveLook(dev, target)
+    lights.each { dev ->
+        Map look = game ? gameLook(dev) : resolveLook(dev, target)
         if (look == null) {
             missing << dev.displayName
             return
         }
-        if (look.type == "alt") {
-            int count = paintAlternate(dev, look.a, look.b)
-            painted << "${dev.displayName}=${look.a}/${look.b} (${count} bulbs)"
-            return
-        }
-        logDebug "${dev.displayName}: setEffect(${look.id}) for '${look.name}'"
-        dev.setEffect(look.id)
-        applied << "${dev.displayName}=${look.id}"
+        String what = sendLook(dev, look)
+        if (what) sent << what
     }
 
-    state.lastApplied = [scene: target, at: now(), reason: reason, attempt: attempt, devices: applied + painted]
-    log.info "Scene '${target}' sent (${reason}, attempt ${attempt}): ${(applied + painted).join(', ') ?: 'none'}"
+    state.lastApplied = [scene: target, at: now(), reason: reason, attempt: attempt, devices: sent]
+    log.info "${game ? 'Game-day look' : 'Scene'} '${target}' sent (${reason}, attempt ${attempt}${only ? ', ' + lights.size() + ' light(s)' : ''}): ${sent.join(', ') ?: 'none'}"
     if (missing) {
-        log.warn "Scene '${target}' not found in catalog for: ${missing.join(', ')} (use 'Reload scene catalogs', or check the name)"
+        log.warn "'${target}' cannot be shown by: ${missing.join(', ')} (scene not in its catalog: use 'Reload scene catalogs', or check the name)"
     }
-    if (applied) {
-        runIn(20, "verifyScenes", [data: [target: target, attempt: attempt], overwrite: true])
-    } else if (painted) {
-        state.lastVerify = [scene: target, at: now(), attempt: attempt, confirmed: [], unconfirmed: [], note: "segment commands cannot be confirmed by the driver"]
+    if (sent) {
+        runIn(20, "verifyScenes", [data: [target: target, attempt: attempt, devices: lights*.id.collect { it.toString() }], overwrite: true])
     }
 }
 
 /**
  * One light's look for a spec of |-separated alternatives: the first alternative this light can do.
- * A scene name resolves when it is in the light's catalog; 'alt:#RRGGBB/#RRGGBB' resolves when the light has per-bulb control.
- * Returns [type: "scene", id, name] or [type: "alt", a, b] or null.
+ * A scene name resolves when it is in the light's catalog; 'alt:#RRGGBB/#RRGGBB' resolves as even/odd bulbs on a light
+ * with per-bulb control, or as one of the two colors on a single bulb.
+ * Returns [type: "scene", id, name], [type: "alt", a, b], [type: "solid", color, slot, a, b] or null.
  */
 Map resolveLook(dev, String spec) {
     if (!spec) return null
@@ -302,7 +325,8 @@ Map resolveLook(dev, String spec) {
         if (!token) continue
         def m = (token =~ /(?i)^alt(?:ernate)?\s*:\s*(#?[0-9A-Fa-f]{6})\s*\/\s*(#?[0-9A-Fa-f]{6})$/)
         if (m.matches()) {
-            if (dev.hasCommand("segmentedColorRgb")) return [type: "alt", a: normHex(m.group(1)), b: normHex(m.group(2))]
+            Map two = twoColorLook(dev, normHex(m.group(1)), normHex(m.group(2)))
+            if (two) return two
             continue
         }
         def id = resolveSceneId(dev, token)
@@ -311,9 +335,87 @@ Map resolveLook(dev, String spec) {
     return null
 }
 
+/** How this light shows a two-color pattern: even/odd bulbs when it has segment control, else the whole bulb in its slot's color. */
+Map twoColorLook(dev, String a, String b) {
+    if (dev.hasCommand("segmentedColorRgb")) return [type: "alt", a: a, b: b]
+    if (dev.hasCommand("setColor")) {
+        String slot = slotOf(dev)
+        return [type: "solid", color: slot == "B" ? b : a, slot: slot, a: a, b: b]
+    }
+    return null
+}
+
+/** The game-day look for one light: the game scene where preferred and present, else the two-color pattern, else the scene fallback. */
+Map gameLook(dev) {
+    def sceneId = gameScene ? resolveSceneId(dev, gameScene) : null
+    boolean preferScene = (gamePattern == "auto" && sceneId != null)
+    if (!preferScene) {
+        if (hexToColorMap(gameColorA) && hexToColorMap(gameColorB)) {
+            Map two = twoColorLook(dev, normHex(gameColorA), normHex(gameColorB))
+            if (two) return two
+        } else {
+            log.warn "Game-day colors must be hex like #69BE28 (got '${gameColorA}' / '${gameColorB}')"
+        }
+    }
+    if (sceneId != null) return [type: "scene", id: sceneId, name: gameScene.trim()]
+    return null
+}
+
+/** Stable identity of a look, used to remember which lights have confirmed it. */
+String lookKey(Map look) {
+    if (look == null) return null
+    if (look.type == "scene") return "scene:${look.id}"
+    if (look.type == "solid") return "solid:${look.color}"
+    return "alt:${look.a}/${look.b}"
+}
+
+/** Send one look to one light. Returns a short description for the log, or null when nothing was sent. */
+String sendLook(dev, Map look) {
+    switch (look?.type) {
+        case "scene":
+            logDebug "${dev.displayName}: setEffect(${look.id}) for '${look.name}'"
+            dev.setEffect(look.id)
+            return "${dev.displayName}=${look.id}"
+        case "alt":
+            int count = paintAlternate(dev, look.a, look.b)
+            return count ? "${dev.displayName}=${look.a}/${look.b} (${count} bulbs)" : null
+        case "solid":
+            return paintSolid(dev, look.color) ? "${dev.displayName}=${look.color} (color ${look.slot})" : null
+    }
+    return null
+}
+
+/** Which color of a two-color pattern a single bulb shows: its setting, else alternate by position among the single bulbs. */
+String slotOf(dev) {
+    def s = settings["altSlot_${dev.id}".toString()]
+    return s ? s.toString() : defaultSlot(dev)
+}
+
+String defaultSlot(dev) {
+    def singles = (goveeLights ?: []).findAll { !it.hasCommand("segmentedColorRgb") }
+    int idx = singles.findIndexOf { it.id == dev.id }
+    return (idx > 0 && idx % 2 == 1) ? "B" : "A"
+}
+
+List selfPoweredLights() {
+    return (goveeLights ?: []).findAll { settings["selfPowered_${it.id}".toString()] }
+}
+
 String normHex(String h) {
     String x = h.trim().toUpperCase()
     return x.startsWith("#") ? x : "#" + x
+}
+
+/** Paint a single bulb one solid color through setColor. Returns false when the color is malformed. */
+boolean paintSolid(dev, String hex) {
+    Map c = hexToColorMap(hex)
+    if (!c) {
+        log.warn "${dev.displayName}: color must be hex like #8B00FF (got '${hex}'); nothing sent"
+        return false
+    }
+    logDebug "${dev.displayName}: setColor(${c}) for ${hex}"
+    dev.setColor(c)
+    return true
 }
 
 /** Paint even bulbs color A and odd bulbs color B through the driver's per-segment command. Returns the bulb count used. */
@@ -334,38 +436,7 @@ int paintAlternate(dev, String hexA, String hexB) {
     return count
 }
 
-/** Game-day two-color pattern: even bulbs get color A, odd bulbs color B, via the driver's per-segment command. Lights without segment control fall back to the game scene by name. */
-def applyAlternate(String reason, attempt) {
-    Map a = hexToColorMap(gameColorA)
-    Map b = hexToColorMap(gameColorB)
-    if (!a || !b) {
-        log.warn "Game-day colors must be hex like #69BE28 (got '${gameColorA}' / '${gameColorB}'); nothing sent"
-        return
-    }
-    def applied = []
-    def fallback = []
-
-    goveeLights.each { dev ->
-        def sceneId = gameScene ? resolveSceneId(dev, gameScene) : null
-        boolean preferScene = (gamePattern == "auto" && sceneId != null)
-        if (!preferScene && dev.hasCommand("segmentedColorRgb")) {
-            int count = paintAlternate(dev, gameColorA, gameColorB)
-            applied << "${dev.displayName} (${count} bulbs)"
-        } else if (sceneId != null) {
-            dev.setEffect(sceneId)
-            fallback << "${dev.displayName}=${sceneId}"
-        } else {
-            log.warn "${dev.displayName}: no segment control and scene '${gameScene}' not in its catalog; left as is"
-        }
-    }
-
-    String label = "Alternate ${gameColorA}/${gameColorB}"
-    state.lastApplied = [scene: label, at: now(), reason: reason, attempt: attempt, devices: applied + fallback]
-    state.lastVerify = [scene: label, at: now(), attempt: attempt, confirmed: [], unconfirmed: [], note: "segment commands cannot be confirmed by the driver"]
-    log.info "Game-day pattern ${label} sent (${reason}, attempt ${attempt}): segments on ${applied.join(', ') ?: 'none'}${fallback ? '; scene fallback on ' + fallback.join(', ') : ''}"
-}
-
-/** "#RRGGBB" -> [hue: 0-100, saturation: 0-100, level: 0-100] as the Govee driver's color map expects; null if malformed. */
+/** "#RRGGBB" ->[hue: 0-100, saturation: 0-100, level: 0-100] as the Govee driver's color map expects; null if malformed. */
 Map hexToColorMap(String hex) {
     String h = hex?.trim()
     if (!(h ==~ /^#?[0-9A-Fa-f]{6}$/)) return null
@@ -489,6 +560,7 @@ def gameWindowStart() {
     log.info "Game window started (${state.gameLabel ?: 'game'})"
     if (appPaused) return
     if (!anyPowerOn()) { logDebug "Lights unpowered; game look will follow at power-on"; return }
+    state.retryStartedAt = now()
     runIn(2, "applyScenes", [data: [reason: "game window start", attempt: 1], overwrite: false])
     runIn(62, "applyScenes", [data: [reason: "game window start", attempt: 2], overwrite: false])
 }
@@ -504,6 +576,7 @@ def endGameWindow(boolean reapply) {
     unschedule("gameWindowEnd")
     log.info "Game window ended (${state.gameLabel ?: 'game'})"
     if (!reapply || appPaused || !anyPowerOn()) return
+    state.retryStartedAt = now()
     runIn(2, "applyScenes", [data: [reason: "game window end", attempt: 1], overwrite: false])
     runIn(62, "applyScenes", [data: [reason: "game window end", attempt: 2], overwrite: false])
 }
@@ -518,27 +591,91 @@ String nextGameText() {
     return "${upcoming.label}, kickoff ${when} (game look ${win}; this app never switches the lights on, the plug automation does that at dusk)${state.gameWindowActive ? ' - ACTIVE NOW' : ''}"
 }
 
-/** The driver only records effectNum when Govee's cloud accepted the command, so a mismatch means it failed (usually "device offline"). */
+/**
+ * Check the lights that were just sent to. The driver only records effectNum when Govee's cloud accepted a scene, and it
+ * sets cloudAPI to "Pending" before every command and "Success" only after the cloud accepted it, so a stale value means
+ * the command failed (usually "device offline"). Segment commands get no usable answer from the driver.
+ */
 def verifyScenes(data) {
     String target = data?.target ?: targetSceneName()
+    boolean game = gameActive() && gamePattern in ["alternate", "auto"]
+    List sentTo = (data?.devices ?: goveeLights*.id).collect { it.toString() }
+    Map confirmedLooks = (state.confirmedLooks ?: [:]) as Map
     def confirmed = []
     def unconfirmed = []
+    def unverifiable = []
     goveeLights.each { dev ->
-        Map look = resolveLook(dev, target)
-        if (look == null || look.type != "scene") return
-        def current = dev.currentValue("effectNum")
-        if (current?.toString() == look.id.toString()) {
-            confirmed << dev.displayName
+        String id = dev.id.toString()
+        if (!(id in sentTo)) return
+        Map look = game ? gameLook(dev) : resolveLook(dev, target)
+        if (look == null) return
+        String key = lookKey(look)
+        String why = null
+        if (look.type == "scene") {
+            def current = dev.currentValue("effectNum")
+            if (current?.toString() != look.id.toString()) why = "driver effectNum=${current ?: 'none'}"
+        } else if (look.type == "solid") {
+            def api = dev.currentValue("cloudAPI")
+            if (api?.toString() != "Success") why = "driver cloudAPI=${api ?: 'none'}"
         } else {
-            unconfirmed << "${dev.displayName} (driver effectNum=${current ?: 'none'})"
+            unverifiable << dev.displayName
+            confirmedLooks[id] = key
+            return
+        }
+        if (why) {
+            unconfirmed << "${dev.displayName} (${why})"
+            confirmedLooks.remove(id)
+        } else {
+            confirmed << dev.displayName
+            confirmedLooks[id] = key
         }
     }
-    state.lastVerify = [scene: target, at: now(), attempt: data?.attempt, confirmed: confirmed, unconfirmed: unconfirmed]
+    state.confirmedLooks = confirmedLooks
+    state.lastVerify = [scene: target, at: now(), attempt: data?.attempt, confirmed: confirmed, unconfirmed: unconfirmed,
+                        note: unverifiable ? "segment commands cannot be confirmed by the driver (${unverifiable.join(', ')})" : null]
     if (unconfirmed) {
-        log.warn "Scene '${target}' NOT confirmed on ${unconfirmed.join(', ')}: Govee's cloud rejected the command, usually 'device offline' (check the light has power and Wi-Fi). Confirmed: ${confirmed ?: 'none'}"
-    } else {
-        log.info "Scene '${target}' confirmed by the driver on ${confirmed.join(', ')}"
+        log.warn "'${target}' NOT confirmed on ${unconfirmed.join(', ')}: Govee's cloud rejected the command, usually 'device offline' (check the light has power and Wi-Fi). Confirmed: ${confirmed ?: 'none'}"
+    } else if (confirmed) {
+        log.info "'${target}' confirmed by the driver on ${confirmed.join(', ')}"
     }
+    armSelfRetry()
+}
+
+/** Self-powered lights whose current look the driver has not confirmed yet. */
+List pendingSelfPowered() {
+    boolean game = gameActive() && gamePattern in ["alternate", "auto"]
+    String target = targetSceneName()
+    Map confirmedLooks = (state.confirmedLooks ?: [:]) as Map
+    return selfPoweredLights().findAll { dev ->
+        Map look = game ? gameLook(dev) : resolveLook(dev, target)
+        look != null && confirmedLooks[dev.id.toString()] != lookKey(look)
+    }
+}
+
+/** Keep re-sending to unconfirmed self-powered lights while the plugs are on, until they confirm or the time limit passes. */
+def armSelfRetry() {
+    unschedule("retrySelfPowered")
+    if (appPaused || !anyPowerOn()) return
+    def pending = pendingSelfPowered()
+    if (!pending) return
+    long started = (state.retryStartedAt ?: 0L) as Long
+    if (!started) { started = now(); state.retryStartedAt = started }
+    long limit = Math.max(1, (selfRetryHours ?: 6) as Integer) * 3600000L
+    if (now() - started > limit) {
+        log.info "Still unconfirmed ${selfRetryHours ?: 6} h after the plugs turned on: ${pending*.displayName.join(', ')}; no more re-sends until the next power-on"
+        return
+    }
+    int mins = Math.max(1, (selfRetryMinutes ?: 5) as Integer)
+    runIn(mins * 60, "retrySelfPowered")
+    logDebug "Re-sending to ${pending*.displayName.join(', ')} in ${mins} min"
+}
+
+def retrySelfPowered() {
+    if (appPaused || !anyPowerOn()) return
+    def pending = pendingSelfPowered()
+    if (!pending) return
+    state.selfRetryCount = ((state.selfRetryCount ?: 0) as Integer) + 1
+    applyScenes([reason: "self-powered re-send", attempt: "r${state.selfRetryCount}", devices: pending*.id.collect { it.toString() }])
 }
 
 /** The scene that should be showing right now: game override, then the active date window, then the default. */
@@ -621,25 +758,28 @@ String statusHtml() {
     sb << "target scene = <b>${target}</b><br/>"
     String power = powerSwitches ? powerSwitches.collect { it.displayName + '=' + it.currentValue('switch') }.join(', ') : 'none selected'
     sb << "<b>Power</b>: ${power}<br/>"
+    boolean game = gameActive() && gamePattern in ["alternate", "auto"]
+    Map confirmedLooks = (state.confirmedLooks ?: [:]) as Map
     goveeLights.each { dev ->
         Map catalog = sceneCatalog(dev)
         String current = dev.currentValue("effectName") ?: dev.currentValue("effectNum") ?: "?"
-        if (gameActive() && gamePattern in ["alternate", "auto"]) {
-            sb << "<b>${dev.displayName}</b>: game-day override active "
+        if (game) {
+            sb << "<b>${dev.displayName}</b>: game-day look &rarr; ${lookDesc(dev, gameLook(dev))} "
         } else {
             sb << "<b>${dev.displayName}</b>: '${target}' &rarr; ${lookText(dev, target)} "
         }
         sb << "(catalog: ${catalog.size()} scenes; driver reports current effect: ${current})<br/>"
+        if (settings["selfPowered_${dev.id}".toString()]) {
+            Map cur = game ? gameLook(dev) : resolveLook(dev, target)
+            boolean ok = cur != null && confirmedLooks[dev.id.toString()] == lookKey(cur)
+            sb << "&nbsp;&nbsp;Self-powered: ${ok ? 'current look confirmed by the driver' : 'not confirmed yet (re-sent every ' + (selfRetryMinutes ?: 5) + ' min while the plugs are on, up to ' + (selfRetryHours ?: 6) + ' h after power-on)'}<br/>"
+        }
         windows().findAll { it.scene }.each { win ->
             sb << "&nbsp;&nbsp;${win.name}: '${win.scene}' &rarr; ${lookText(dev, win.scene)}<br/>"
         }
-        if (gameSwitch && gamePattern in ["alternate", "auto"]) {
-            def gid = gameScene ? resolveSceneId(dev, gameScene) : null
-            def cnt = settings["segCount_${dev.id}".toString()] ?: 15
-            String seg = dev.hasCommand("segmentedColorRgb") ? "segments supported, ${cnt} bulbs" : "NO segment control"
-            String plan = (gamePattern == "auto" && gid != null) ? "scene '${gameScene}' &rarr; ${gid}" : "alternate ${gameColorA} / ${gameColorB} (${seg})"
-            sb << "&nbsp;&nbsp;Game day: ${plan}<br/>"
-        } else if (gameSwitch && gameScene) {
+        if ((gameSwitch || scheduleEnabled) && gamePattern in ["alternate", "auto"]) {
+            sb << "&nbsp;&nbsp;Game day: ${lookDesc(dev, gameLook(dev))}<br/>"
+        } else if ((gameSwitch || scheduleEnabled) && gameScene) {
             def gid = resolveSceneId(dev, gameScene)
             sb << "&nbsp;&nbsp;Game day: '${gameScene}' &rarr; ${gid != null ? gid : notFound()}<br/>"
         }
@@ -654,6 +794,7 @@ String statusHtml() {
         String vwhen = new Date(state.lastVerify.at as Long).format("yyyy-MM-dd HH:mm:ss", location.timeZone)
         String unconfirmed = state.lastVerify.unconfirmed ? state.lastVerify.unconfirmed.join(', ') : 'none'
         sb << "<b>Last verification</b> at ${vwhen}: confirmed on ${state.lastVerify.confirmed ?: 'none'}; not confirmed on ${unconfirmed}"
+        if (state.lastVerify.note) sb << " (${state.lastVerify.note})"
     } else {
         sb << "<b>Last verification</b>: none yet"
     }
@@ -666,12 +807,16 @@ String notFound() {
 }
 
 String lookText(dev, String spec) {
-    Map look = resolveLook(dev, spec)
+    return lookDesc(dev, resolveLook(dev, spec))
+}
+
+String lookDesc(dev, Map look) {
     if (look == null) return notFound()
     if (look.type == "alt") {
         def cnt = settings["segCount_${dev.id}".toString()] ?: 15
         return "alternate ${look.a} / ${look.b} (${cnt} bulbs)"
     }
+    if (look.type == "solid") return "solid ${look.color} (color ${look.slot} of ${look.a} / ${look.b})"
     return "${look.id} ('${look.name}')"
 }
 
