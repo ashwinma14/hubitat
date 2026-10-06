@@ -8,7 +8,7 @@ deployed through the hub's MCP Rule Server (`importUrl`), with `deploy.sh` as th
 | File | App | Hub instance |
 |------|-----|--------------|
 | GreatRoomLighting.groovy | Great Room Lighting Controller (v1.38) | app:584 (Apps Code id 529) |
-| GoveeHolidayScenes.groovy | Govee Holiday Scenes (v1.7) — scene-by-date for the Govee string lights | (installed from Apps Code) |
+| GoveeHolidayScenes.groovy | Govee Holiday Scenes (v1.8) — scene-by-date for the Govee string lights, deck lights and pathway bulbs | app:590 (Apps Code id 590) |
 | GreatRoomLightingLogger.gs | Google Apps Script webhook for Sheets logging | (Google) |
 | tools/LuxCsvRepair.groovy | One-off utility: rebuilt `lux_clean.csv` on 2026-09-30 (used once, then removed from the hub) | none |
 
@@ -46,6 +46,15 @@ Hubitat connector:
    byte count (the source is ASCII, so chars == bytes), and the FNV-1a of the hub
    source equals the git file's (e.g. from the hub's `/app/ajax/code?id=529`).
 5. If the change touched subscriptions or inputs, open the app and click **Done**.
+
+## Govee Holiday Scenes (app 590)
+
+Lights: string lights 433 and deck lights 434 (powered by the Twinkle/Front Lights plugs),
+pathway bulbs 436 and 437 (Govee H600A, own power: no plug event, so they are marked
+"self-powered" and re-sent every 5 min while the plugs are on until the driver reports
+`cloudAPI=Success`). A two-color spec such as `alt:#8B00FF/#FF5500` alternates bulbs on the
+deck lights and paints a single bulb one color (436 = first color, 437 = second).
+Game days override everything with the Seahawks colors the same way.
 
 ## Motion Logger (Rule Machine rule 544)
 
