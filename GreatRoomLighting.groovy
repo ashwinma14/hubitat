@@ -6,6 +6,11 @@
  *
  *  Author: Claude (for Ashwin)
  *  Date: 2026-02-12
+ *  Version: 1.39 - daylight turn-off works again: the bookcase sensor reports a percentage that pegs at 100, so its
+ *                  off-threshold is capped at 100 (80 + 30 = 110 was unreachable and it voted "dark" all day while the
+ *                  lights were on); a 10-minute recheck catches a lit room that reads bright when no lux transition
+ *                  fired; the mmWave must stay active 45 s before it anchors the dead-end inference (its 17-second
+ *                  blips were extending the living-room hold)
  *  Version: 1.38 - mornings use the day scene's levels: Night mode lasts until outdoor light reaches 300 lux, so
  *                  the morning ramp used to climb toward the evening's mood levels (pendant 30%, hallway 80%)
  *                  instead of the day's (pendant 100%, hallway 99%); from predawn end until noon the day scene applies
@@ -44,7 +49,7 @@ preferences {
     page(name: "mainPage")
 }
 
-def appVersion() { return "1.38" }
+def appVersion() { return "1.39" }
 
 def mainPage() {
     dynamicPage(name: "mainPage", title: "Great Room Lighting Controller", install: true, uninstall: true) {
@@ -88,6 +93,7 @@ def mainPage() {
             paragraph "The living room is a dead end: once it has seen someone, it stays occupied until a sensor outside it fires after the living room last did. Sitting still never times the house out; walking out through the kitchen does. The kitchen/dining/hallway zone dims after a few quiet minutes while the room is on and comes straight back on motion."
             input "lrBackstopMinutes", "number", title: "Living room: give up the dead-end inference after this many minutes with no activity anywhere", defaultValue: 45, required: true, width: 6
             input "lrExitGraceSeconds", "number", title: "Kitchen-zone activity within this many seconds after living-room activity counts as the same movement", defaultValue: 20, required: true, width: 6
+            input "lrMmwaveAnchorSeconds", "number", title: "The living-room mmWave must stay active this many seconds before it counts as living-room motion (its shorter blips are noise; the PIR counts at once)", defaultValue: 45, required: true, width: 6
             input "kzDimMinutes", "number", title: "Kitchen zone dims after this many quiet minutes", defaultValue: 5, required: true, width: 4
             input "kzDimPercent", "number", title: "Dimmed hallway and pendant: percent of their scene level", defaultValue: 30, required: true, width: 4
             input "kzDiningDim", "number", title: "Dimmed dining level", defaultValue: 30, required: true, width: 4
@@ -371,6 +377,7 @@ def delayedInitialEvaluation() {
         }
     } else {
         log.info "Waiting for events (motion, mode changes, etc.) to take action..."
+        brightRoomSafetyNet()
     }
 }
 
@@ -421,12 +428,27 @@ def isLightNeeded() {
     return modeNeedsLight || indoorNeedsLight || cloudyNeedsLight
 }
 
-/** One indoor sensor's vote: below its on-threshold with the lights off; below on-threshold + 30 with them on. */
+/**
+ * One indoor sensor's vote: below its on-threshold with the lights off; below on-threshold + 30 with them on.
+ * A sensor that reports a percentage (the Zooz ZSE40) pegs at 100 in any real daylight, so its off-threshold is capped
+ * at 100: with an on-threshold of 80 the band would otherwise end at 110, a reading it can never produce, and the
+ * sensor would vote "dark" for as long as the lights were on (2026-10-06: lights on at 55% in a 400-lux kitchen).
+ */
 boolean sensorDark(dev, Number onThreshold, boolean lightsOn) {
     def lux = dev?.currentIlluminance
     if (lux == null) return false
     BigDecimal on = (onThreshold ?: 0) as BigDecimal
-    return (lux as BigDecimal) < (lightsOn ? on + 30 : on)
+    BigDecimal off = on + 30
+    if (percentSensor(dev)) off = off.min(100 as BigDecimal)
+    return (lux as BigDecimal) < (lightsOn ? off : on)
+}
+
+boolean percentSensor(dev) {
+    try {
+        return "${dev?.currentState('illuminance')?.unit}" == "%"
+    } catch (e) {
+        return false
+    }
 }
 
 /** True when either indoor sensor reads below its turn-on threshold right now (no hysteresis). */
@@ -880,18 +902,24 @@ def resetTvTime() {
 
 def livingRoomPresenceHandler(evt) {
     logDebug "Living room presence: ${evt.value}"
-    if (evt.value == "active") state.lastLrMotionAt = now()
-    
+    // The mmWave blips for a few seconds on nothing (a fan, a curtain); such a blip must not anchor the dead-end
+    // inference or the PIR veto, so it counts as living-room motion only once it has stayed active for a while.
+    // The bookcase PIR counts immediately (lrMotionHandler).
+    if (evt.value == "active") {
+        runIn(Math.max(5, (lrMmwaveAnchorSeconds ?: 45) as Integer), "lrMmwaveAnchor")
+    } else {
+        unschedule("lrMmwaveAnchor")
+    }
+
     // Check if lights are actually on (not relying on state variables)
     def lightsOn = lrHueLights?.currentSwitch == "on"
-    
+
     // If lights are on and not in override/TV mode, adjust zone levels
     if (lightsOn && !state.manualOverride && !state.tvTimeActive) {
         def currentLux = luxSensor?.currentIlluminance ?: 0
-        
+
         if (evt.value == "active") {
             // Cancel any pending dim and immediately brighten (LR ceiling only)
-            state.lastLrMotionAt = now()
             unschedule(applyLrDimmed)
             safeLogToSheet("zone", "LR active", "brightening", currentLux)
             applyLrZoneLevel(true)
@@ -900,6 +928,14 @@ def livingRoomPresenceHandler(evt) {
             logDebug "LR inactive - will dim in ${lrDimDelay ?: 60} seconds"
             runIn(lrDimDelay ?: 60, applyLrDimmed)
         }
+    }
+}
+
+/** The mmWave has stayed active for lrMmwaveAnchorSeconds: that is real presence, not a blip. */
+def lrMmwaveAnchor() {
+    if (livingRoomPresence?.currentValue("mmwave") == "active") {
+        state.lastLrMotionAt = now()
+        logDebug "mmWave active for ${lrMmwaveAnchorSeconds ?: 45}s - counts as living-room motion"
     }
 }
 
@@ -1374,7 +1410,22 @@ def ambientStep(String reason) {
 }
 
 def ambientRecheck() {
+    brightRoomSafetyNet()
     ambientStep("recheck")
+}
+
+/**
+ * The lux handlers act on a transition of lightNeeded. If the transition was missed (an app update recomputed it, a
+ * sensor sat pegged), the room would stay lit in daylight for as long as someone is around; catch that here with the
+ * same 10-minute debounce the handlers use.
+ */
+def brightRoomSafetyNet() {
+    if (appPaused || !roomIsOn() || !state.presenceActive || state.manualOverride || state.tvTimeActive || state.pendingBrightOff) return
+    state.lightNeeded = isLightNeeded()
+    if (state.lightNeeded) return
+    state.pendingBrightOff = true
+    log.info "Lights are on but the room reads bright (${indoorReadings()}, mode ${location.mode}) - will turn off in 10 minutes if still bright"
+    runIn(600, turnOffDueToBright)
 }
 
 def reapplyCurrentScene(String reason, Integer fade) {
