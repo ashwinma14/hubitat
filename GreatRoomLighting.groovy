@@ -6,6 +6,9 @@
  *
  *  Author: Claude (for Ashwin)
  *  Date: 2026-02-12
+ *  Version: 1.40 - a covered or failed outdoor sensor no longer keeps the room lit all day: under 50 lux outdoors with
+ *                  the sun up is treated as a sensor fault, Night mode is overruled while the indoor sensors read
+ *                  bright, and a warning names the sensor (2026-10-11: covered at 13:57, Night mode for 23 hours)
  *  Version: 1.39 - daylight turn-off works again: the bookcase sensor reports a percentage that pegs at 100, so its
  *                  off-threshold is capped at 100 (80 + 30 = 110 was unreachable and it voted "dark" all day while the
  *                  lights were on); a 10-minute recheck catches a lit room that reads bright when no lux transition
@@ -49,7 +52,7 @@ preferences {
     page(name: "mainPage")
 }
 
-def appVersion() { return "1.39" }
+def appVersion() { return "1.40" }
 
 def mainPage() {
     dynamicPage(name: "mainPage", title: "Great Room Lighting Controller", install: true, uninstall: true) {
@@ -430,10 +433,41 @@ def isLightNeeded() {
             cloudyNeedsLight = (outdoorLux < luxThreshold)
         }
     }
-    
+
+    // A covered or failed outdoor sensor reads "night" all day and drags the mode with it (2026-10-11: 11,229 lux at
+    // 13:56, 31 lux a minute later, and Night mode for the next 23 hours). While the sun is up and the room reads bright,
+    // the sensor is overruled: the indoor sensors decide, and the cloud rule (which also trusts it) is off.
+    if (outdoorSensorImplausible()) {
+        if (modeNeedsLight && !indoorNeedsLight) {
+            modeNeedsLight = false
+            warnOutdoorSensor(outdoorLux)
+        }
+        cloudyNeedsLight = false
+    }
+
     logDebug "isLightNeeded: mode=${location.mode} (${modeNeedsLight}), indoor ${indoorReadings()} lightsOn=${lightsCurrentlyOn} (${indoorNeedsLight}), clouds=${cloudiness}%/${cloudThreshold}% outdoorLux=${outdoorLux}/${luxThreshold}/${luxOffThreshold} (${cloudyNeedsLight})"
-    
+
     return modeNeedsLight || indoorNeedsLight || cloudyNeedsLight
+}
+
+/** Below 50 lux outdoors an hour or more after sunrise and before sunset is not weather; it is a covered sensor, a dead one, or one knocked to face the ground. */
+boolean outdoorSensorImplausible() {
+    def lux = outdoorLuxSensor?.currentIlluminance
+    if (lux == null || (lux as BigDecimal) >= 50) return false
+    try {
+        long t = now()
+        return t > location.sunrise.time + 3600000L && t < location.sunset.time - 3600000L
+    } catch (e) {
+        return false
+    }
+}
+
+/** One warning an hour while the outdoor sensor is being overruled. */
+void warnOutdoorSensor(outdoorLux) {
+    long last = (state.outdoorFaultWarnedAt ?: 0L) as Long
+    if (now() - last < 3600000L) return
+    state.outdoorFaultWarnedAt = now()
+    log.warn "Outdoor sensor reads ${outdoorLux} lux with the sun up - it is covered, faulty or pointing at the ground. Ignoring the mode it set; the indoor sensors (${indoorReadings()}) say the room is bright. Check the sensor."
 }
 
 /**
@@ -1478,7 +1512,8 @@ String adaptiveStatus() {
     String predawnAt = String.format('%02d:%02d', (endMins / 60) as Integer, endMins % 60)
     String ramp = state.morningRamp ? "morning ramp at ${rampFactor()}%" : "no morning ramp running"
     String floor = state.factorFloor ? ", dark-room floor ${state.factorFloor}%" : ""
-    return "Outdoor ${lux != null ? lux + ' lux' : 'sensor missing'}: band ${rawAmbientFactor()}%, applied factor ${state.ambientFactor ?: '-'}%${floor}; " +
+    String fault = outdoorSensorImplausible() ? " <b>(implausible with the sun up: sensor covered or faulty, overruled)</b>" : ""
+    return "Outdoor ${lux != null ? lux + ' lux' : 'sensor missing'}${fault}: band ${rawAmbientFactor()}%, applied factor ${state.ambientFactor ?: '-'}%${floor}; " +
            "${ramp}; predawn ends ${predawnAt} today; scene now: ${state.currentScene ?: 'off'}; " +
            "cans ${cansWanted((state.lastFactor ?: state.ambientFactor ?: 100) as Integer) ? 'allowed' : 'held off'} (from a ${cansFactor ?: 75}% factor)"
 }
