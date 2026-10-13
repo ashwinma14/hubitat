@@ -7,7 +7,7 @@ deployed through the hub's MCP Rule Server (`importUrl`), with `deploy.sh` as th
 
 | File | App | Hub instance |
 |------|-----|--------------|
-| GreatRoomLighting.groovy | Great Room Lighting Controller (v1.38) | app:584 (Apps Code id 529) |
+| GreatRoomLighting.groovy | Great Room Lighting Controller (v1.42) | app:584 (Apps Code id 529) |
 | GoveeHolidayScenes.groovy | Govee Holiday Scenes (v1.8) — scene-by-date for the Govee string lights, deck lights and pathway bulbs | app:590 (Apps Code id 590) |
 | GreatRoomLightingLogger.gs | Google Apps Script webhook for Sheets logging | (Google) |
 | tools/LuxCsvRepair.groovy | One-off utility: rebuilt `lux_clean.csv` on 2026-09-30 (used once, then removed from the hub) | none |
@@ -46,6 +46,16 @@ Hubitat connector:
    byte count (the source is ASCII, so chars == bytes), and the FNV-1a of the hub
    source equals the git file's (e.g. from the hub's `/app/ajax/code?id=529`).
 5. If the change touched subscriptions or inputs, open the app and click **Done**.
+
+## Great Room: manual changes (v1.41-1.42)
+
+A switch press (or a Hue-app / dashboard change that is not the app's own command) takes
+that one light out of the automation; the rest of the room carries on. It comes back at the
+next scene change (predawn end, wind-down, mode change, TV time, everyone leaving, room off)
+or after 6 h. A press put back where the automation had it counts for nothing; three presses
+in 30 s is a child and the scene is restored after 20 s; a brighter press during the morning
+ramp is a floor the ramp continues from. The kitchen cans switch (Zooz ZEN71, Advanced
+driver) shows red while under manual control.
 
 ## Govee Holiday Scenes (app 590)
 
