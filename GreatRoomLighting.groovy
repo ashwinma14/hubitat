@@ -6,6 +6,10 @@
  *
  *  Author: Claude (for Ashwin)
  *  Date: 2026-02-12
+ *  Version: 1.42 - manual changes, as the house asked (survey 2026-10-13): a press put back within 10 s is nothing;
+ *                  three presses in 30 s is play, the light is put back after 20 s; a brighter press during the morning
+ *                  ramp is a floor the ramp continues from; Hue-app and dashboard changes count as manual (not our own
+ *                  commands or their echoes); the cans switch LED turns red while under manual control; cap 6 h
  *  Version: 1.41 - manual overrides are per light: a physical press takes that light out of the automation until the
  *                  next scene change or 180 minutes; the rest of the room carries on (a tap on the kitchen cans at
  *                  06:48 used to freeze everything, so the morning ramp never ran and the room stayed at predawn levels)
@@ -55,7 +59,7 @@ preferences {
     page(name: "mainPage")
 }
 
-def appVersion() { return "1.41" }
+def appVersion() { return "1.42" }
 
 def mainPage() {
     dynamicPage(name: "mainPage", title: "Great Room Lighting Controller", install: true, uninstall: true) {
@@ -89,7 +93,11 @@ def mainPage() {
             input "cloudyThreshold", "number", title: "Cloud cover % threshold (turn on if above)", defaultValue: 70, required: true
             input "cloudyLuxThreshold", "number", title: "Outdoor lux threshold for cloudy check", defaultValue: 400, required: true
             input "presenceTimeout", "number", title: "Minutes before presence times out", defaultValue: 8, required: true
-            input "manualOverrideMinutes", "number", title: "A physical switch press takes that one light out of the automation until the next scene change (predawn end, wind-down, mode change, TV time, everyone leaving) or this many minutes, whichever is first (0 = scene changes only)", defaultValue: 180, required: true
+            input "manualOverrideMinutes", "number", title: "A switch press takes that one light out of the automation until the next scene change (predawn end, wind-down, mode change, TV time, everyone leaving) or this many minutes, whichever is first (0 = scene changes only). A press put back within 10 s counts for nothing; three presses in 30 s is play and the light is put back; a brighter press during the morning ramp becomes a floor the ramp continues from.", defaultValue: 360, required: true
+            input "appChangesAreManual", "bool", title: "Changes from the Hue app, a dashboard or another app count as manual too (anything that is not this app's own command)", defaultValue: true
+            input "overrideLedColor", "enum", title: "Switch LED color while a light is under manual control (Zooz ZEN7x switches with the Advanced driver only)", options: ["Red", "Green", "White", "Blue"], defaultValue: "Red", width: 4
+            input "normalLedColor", "enum", title: "That switch's normal LED color", options: ["Blue", "White", "Green", "Red"], defaultValue: "Blue", width: 4
+            input "normalLedMode", "enum", title: "Its normal LED mode", options: ["Default", "Reverse", "Off", "On"], defaultValue: "Default", width: 4
             input "lightsOffDelay", "number", title: "Seconds delay before turning lights off", defaultValue: 10, required: true
             input "lrDimDelay", "number", title: "Seconds before LR ceiling dims after leaving the room", defaultValue: 60, required: true
             input "lrBrightHoldMinutes", "number", title: "Minimum minutes LR ceiling stays bright after brightening (anti-flicker)", defaultValue: 3, required: true
@@ -294,13 +302,12 @@ def initialize() {
     subscribe(location, "mode", modeHandler)
     
     // Subscribe to manual switch changes for override detection
-    if (diningSwitch) subscribe(diningSwitch, "switch", manualSwitchHandler)
-    if (hallwaySwitch) subscribe(hallwaySwitch, "switch", manualSwitchHandler)
-    if (kitchenCans) subscribe(kitchenCans, "switch", manualSwitchHandler)
-    if (kitchenPendant) subscribe(kitchenPendant, "switch", manualSwitchHandler)
-    if (bookcaseGOLamp) subscribe(bookcaseGOLamp, "switch", manualSwitchHandler)
-    if (bookcaseColorLamp) subscribe(bookcaseColorLamp, "switch", manualSwitchHandler)
-    if (lrHueLights) subscribe(lrHueLights, "switch", manualSwitchHandler)
+    [diningSwitch, hallwaySwitch, kitchenCans, kitchenPendant, bookcaseGOLamp, bookcaseColorLamp, lrHueLights].findAll { it }.each { dev ->
+        subscribe(dev, "switch", manualSwitchHandler)
+        if (dev.hasAttribute("level")) subscribe(dev, "level", manualSwitchHandler)
+    }
+    state.presses = [:]
+    state.rampFloor = state.morningRamp ? (state.rampFloor ?: [:]) : null
     
     // Initialize state
     state.presenceActive = (motionZone.currentMotion == "active")
@@ -587,6 +594,7 @@ def morningRampStep() {
     Integer rf = rampFactor()
     if (rf >= 100) {
         state.morningRamp = null
+        state.rampFloor = null
         log.info "Morning ramp complete"
     } else {
         runIn(180, "morningRampStep")
@@ -1171,42 +1179,127 @@ def modeHandler(evt) {
 }
 
 def manualSwitchHandler(evt) {
-    // Detect if a switch was changed manually (physical button press)
-    def timeSinceAutomation = now() - (state.lastAutomationAction ?: 0)
-    def isPhysical = (evt.type == "physical" || evt.isPhysical())
-    
-    logDebug "Switch change: ${evt.device.displayName} = ${evt.value}, type=${evt.type}, isPhysical=${isPhysical}, timeSinceAuto=${timeSinceAutomation}ms"
-    
-    // Only set manual override if it was a PHYSICAL button press
-    // Digital commands from other automations should not trigger override
-    if (isPhysical && !state.turningOff) {
-        log.info "Physical switch change detected: ${evt.device.displayName} = ${evt.value} - that light is left alone until the next scene change (${manualOverrideMinutes ?: 180} min at most); the rest of the room carries on"
-        def currentLux = luxSensor?.currentIlluminance ?: 0
-        safeLogToSheet("manual", evt.value, "${evt.device.displayName} (physical)", currentLux)
-        addOverride(evt.device)
-    } else if (timeSinceAutomation > 10000 && !state.turningOff) {
-        // Log other automations for debugging but don't set override
-        logDebug "Other automation changed: ${evt.device.displayName} = ${evt.value}"
-        def currentLux = luxSensor?.currentIlluminance ?: 0
-        safeLogToSheet("other_auto", evt.value, evt.device.displayName, currentLux)
+    def dev = evt.device
+    boolean isPhysical = (evt.type == "physical" || evt.isPhysical())
+    if (state.turningOff) { logDebug "Ignoring ${dev.displayName} ${evt.name}=${evt.value} while turning the room off"; return }
+    Integer nowLevel = effectiveLevel(dev)
+    Map cmd = commandedFor(dev)
+    logDebug "Change: ${dev.displayName} ${evt.name}=${evt.value} (${isPhysical ? 'physical' : 'digital'}), now ${nowLevel}%, commanded ${cmd?.level}% until ${cmd?.until}"
+
+    if (!isPhysical) {
+        // Hue app, dashboard or another app: counts as manual only when it is clearly not our own command or its echo
+        if (appChangesAreManual == false || state.tvTimeActive) return
+        long until = (cmd?.until ?: 0L) as Long
+        if (now() < until || now() - ((state.lastAutomationAction ?: 0L) as Long) < 90000L) {
+            logDebug "${dev.displayName}: our own command (or its echo) - ignored"
+            return
+        }
+        if (cmd?.level == null) { logDebug "${dev.displayName}: no commanded level on record - ignored"; return }
+        Integer expected = cmd.level as Integer
+        boolean onOffChange = (expected == 0) != (nowLevel == 0)
+        if (!onOffChange && Math.abs(nowLevel - expected) < 10) {
+            logDebug "${dev.displayName}: ${nowLevel}% vs commanded ${expected}% - drift, ignored"
+            return
+        }
+        log.info "${dev.displayName} changed outside the automation (app or dashboard): ${nowLevel == 0 ? 'off' : nowLevel + '%'} vs commanded ${expected == 0 ? 'off' : expected + '%'}"
     } else {
-        logDebug "Ignoring switch change (our automation): ${evt.device.displayName} = ${evt.value}"
+        log.info "Physical switch change detected: ${dev.displayName} ${evt.name} = ${evt.value}"
     }
+    def currentLux = luxSensor?.currentIlluminance ?: 0
+    safeLogToSheet("manual", "${evt.name}=${evt.value}", "${dev.displayName} (${isPhysical ? 'physical' : 'app'})", currentLux)
+    handleManualChange(dev, nowLevel, cmd?.level == null ? null : (cmd.level as Integer))
 }
 
 // ==================== MANUAL OVERRIDES (per device) ====================
 // A physical press used to freeze the whole automation until the house emptied: a tap on the kitchen cans at 06:48
 // stopped the morning ramp and the room stayed at predawn levels (2026-10-13). Now a press takes only that device out
 // of the automation; the rest of the room carries on. The device returns at the next scene transition (predawn end,
-// wind-down, a mode change, TV time, everyone leaving) or after manualOverrideMinutes, whichever comes first.
+// wind-down, a mode change, TV time, everyone leaving, room off) or after manualOverrideMinutes, whichever comes first.
+// Survey 2026-10-13: a press put back within 10 s is nothing; three presses in 30 s is a child, put it back; a brighter
+// press during the morning ramp is a floor the ramp continues from; the switch LED shows an override where it can.
+
+/** One manual change on one light: decide whether it is nothing, play, a ramp floor, or an override. */
+void handleManualChange(dev, Integer nowLevel, Integer expectedLevel) {
+    String id = dev.id.toString()
+    long t = now()
+    Map presses = (state.presses ?: [:]) as Map
+    Map p = (presses[id] ?: [:]) as Map
+    List times = ((p.times ?: []) as List).collect { it as Long }.findAll { it > t - 30000L }
+    // the switch and level events of one tap arrive together (and a hold reports as it goes): count them once
+    boolean samePress = times && (t - times[-1]) < 3000L
+    if (!samePress) times << t
+    Integer from = (times.size() == 1 || p.from == null) ? (expectedLevel != null ? expectedLevel : nowLevel) : (p.from as Integer)
+    presses[id] = [times: times, from: from, at: t]
+    state.presses = presses
+
+    if (times.size() >= 3) {
+        dropOverride(dev)
+        unschedule("restoreAfterPlay")
+        log.info "${dev.displayName}: ${times.size()} presses in 30 s - somebody is playing with it; no override, back to the scene in 20 s"
+        runIn(20, "restoreAfterPlay")
+        return
+    }
+    if (times.size() == 2 && nowLevel == from) {
+        dropOverride(dev)
+        log.info "${dev.displayName}: pressed and put back within ${((t - times[0]) / 1000) as Integer} s - treated as nothing happened"
+        return
+    }
+    if (state.morningRamp && rampFactor() < 100 && nowLevel > from) {
+        Map floors = (state.rampFloor ?: [:]) as Map
+        floors[id] = nowLevel
+        state.rampFloor = floors
+        dropOverride(dev)
+        log.info "${dev.displayName} set to ${nowLevel}% during the morning ramp - the ramp continues from there"
+        return
+    }
+    addOverride(dev)
+    log.info "${dev.displayName} is left alone until the next scene change (${manualOverrideMinutes ?: 360} min at most); the rest of the room carries on"
+}
+
+def restoreAfterPlay() {
+    if (!state.presenceActive) return
+    evaluateLighting("after play")
+}
+
+/** The light's level as a person sees it: 0 when off, else its level (100 for a plain switch). */
+Integer effectiveLevel(dev) {
+    if (!dev || dev.currentValue("switch") != "on") return 0
+    def lvl = dev.hasAttribute("level") ? dev.currentValue("level") : null
+    return lvl == null ? 100 : Math.max(1, (lvl as BigDecimal).intValue())
+}
+
+/** Remember what we told a light to do, and until when its echo may still arrive (fades run up to a minute). */
+void noteCommand(dev, Integer level, Number fadeSeconds) {
+    if (!dev) return
+    Map c = (state.commanded ?: [:]) as Map
+    c[dev.id.toString()] = [level: level, until: now() + (((fadeSeconds ?: 0) as Long) * 1000L) + 20000L]
+    state.commanded = c
+}
+
+Map commandedFor(dev) {
+    if (!dev) return null
+    return ((state.commanded ?: [:]) as Map)[dev.id.toString()] as Map
+}
 
 void addOverride(dev) {
     if (!dev) return
     Map o = (state.overrides ?: [:]) as Map
-    Integer mins = (manualOverrideMinutes ?: 180) as Integer
+    boolean fresh = !o.containsKey(dev.id.toString())
+    Integer mins = (manualOverrideMinutes ?: 360) as Integer
     o[dev.id.toString()] = mins > 0 ? now() + mins * 60000L : 4102444800000L
     state.overrides = o
     state.manualOverride = true
+    if (fresh) showOverrideLed(dev, true)
+}
+
+void dropOverride(dev) {
+    if (!dev) return
+    Map o = (state.overrides ?: [:]) as Map
+    if (o.remove(dev.id.toString()) != null) {
+        state.overrides = o
+        state.manualOverride = !o.isEmpty()
+        showOverrideLed(dev, false)
+    }
 }
 
 /** True while this device is under a manual override; an expired one is dropped on the way through. */
@@ -1216,9 +1309,7 @@ boolean overridden(dev) {
     def until = o[dev.id.toString()]
     if (until == null) return false
     if ((until as Long) <= now()) {
-        o.remove(dev.id.toString())
-        state.overrides = o
-        state.manualOverride = !o.isEmpty()
+        dropOverride(dev)
         log.info "${dev.displayName}: manual override expired - back under automation"
         return false
     }
@@ -1227,9 +1318,18 @@ boolean overridden(dev) {
 
 void clearOverrides(String reason) {
     Map o = (state.overrides ?: [:]) as Map
-    if (o) log.info "Manual overrides cleared (${reason}): ${overrideText()}"
+    if (o) {
+        log.info "Manual overrides cleared (${reason}): ${overrideText()}"
+        overrideDevices().each { showOverrideLed(it, false) }
+    }
     state.overrides = [:]
     state.manualOverride = false
+}
+
+List overrideDevices() {
+    Map o = (state.overrides ?: [:]) as Map
+    def all = [diningSwitch, hallwaySwitch, kitchenPendant, kitchenCans, lrHueLights, bookcaseGOLamp, bookcaseColorLamp].findAll { it }
+    return o.keySet().collect { id -> all.find { it.id.toString() == id } }.findAll { it }
 }
 
 String overrideText() {
@@ -1237,6 +1337,29 @@ String overrideText() {
     if (!o) return "none"
     def all = [diningSwitch, hallwaySwitch, kitchenPendant, kitchenCans, lrHueLights, bookcaseGOLamp, bookcaseColorLamp].findAll { it }
     return o.keySet().collect { id -> all.find { it.id.toString() == id }?.displayName ?: "device ${id}" }.join(", ")
+}
+
+/** Switches whose driver exposes the Zooz LED (setLED / setLEDMode) show an override in color; the others cannot. */
+void showOverrideLed(dev, boolean on) {
+    if (!dev || !dev.hasCommand("setLED") || !dev.hasCommand("setLEDMode")) return
+    try {
+        if (on) {
+            dev.setLEDMode("On")
+            dev.setLED(overrideLedColor ?: "Red")
+        } else {
+            dev.setLED(normalLedColor ?: "Blue")
+            dev.setLEDMode(normalLedMode ?: "Default")
+        }
+    } catch (e) {
+        logDebug "${dev.displayName}: LED command failed (${e.message})"
+    }
+}
+
+/** Morning ramp floors: a light someone brightened mid-ramp never drops below that until the ramp completes. */
+Integer floored(dev, Integer level) {
+    if (!dev || !state.morningRamp) return level
+    def f = ((state.rampFloor ?: [:]) as Map)[dev.id.toString()]
+    return f == null ? level : Math.max(level, f as Integer)
 }
 
 // ==================== MAIN LOGIC ====================
@@ -1432,6 +1555,7 @@ boolean cansWanted(Integer factor) {
 def setCans(boolean on) {
     if (!kitchenCans) return
     if (overridden(kitchenCans)) { logDebug "${kitchenCans.displayName}: manual override - left alone"; return }
+    noteCommand(kitchenCans, on ? 100 : 0, 0)
     if (on && kitchenCans.currentSwitch != "on") kitchenCans.on()
     else if (!on) {
         unschedule("cansOnDelayed")
@@ -1481,6 +1605,7 @@ def setLevelSmooth(dev, Number level, Number seconds) {
     if (overridden(dev)) { logDebug "${dev.displayName}: manual override - left alone"; return }
     Integer lvl = Math.max(0, Math.min(100, (level ?: 0) as Integer))
     Integer sec = Math.max(0, (seconds ?: 0) as Integer)
+    noteCommand(dev, lvl, sec)
     try {
         dev.setLevel(lvl, sec)
     } catch (e) {
@@ -1583,13 +1708,13 @@ def applyDayScene(Number fadeOverride = null) {
     
     // Check if living room is occupied (default to true if sensor not configured)
     def lrOccupied = livingRoomOccupied()
-    Integer lrLevel = scaled(lrOccupied ? (dayHueLevel ?: 100) : 50)
-    Integer hallwayLevel = scaled(dayHallwayLevel ?: 99)
-    Integer pendantLevel = scaled(dayKitchenPendantLevel ?: 100)
+    Integer lrLevel = floored(lrHueLights, scaled(lrOccupied ? (dayHueLevel ?: 100) : 50))
+    Integer hallwayLevel = floored(hallwaySwitch, scaled(dayHallwayLevel ?: 99))
+    Integer pendantLevel = floored(kitchenPendant, scaled(dayKitchenPendantLevel ?: 100))
 
-    // Dining Edisons step 50 / 75 / 100 with the factor
-    Integer diningLevel = diningLevelFor(factor)
-    boolean cansOn = cansWanted(factor)
+    // Dining Edisons step 50 / 75 / 100 with the factor; a light brightened mid-ramp keeps its floor
+    Integer diningLevel = floored(diningSwitch, diningLevelFor(factor))
+    boolean cansOn = cansWanted(factor) || floored(kitchenCans, 0) > 0
     state.kzFull = [hallway: hallwayLevel, pendant: pendantLevel, dining: diningLevel, cans: cansOn]
 
     // Kitchen zone still quiet: keep it dimmed through this re-apply
@@ -1789,6 +1914,8 @@ def turnAllLightsOff() {
     state.turningOff = true
     def currentLux = luxSensor?.currentIlluminance ?: 0
     clearOverrides("room turning off")
+    state.rampFloor = null
+    [diningSwitch, hallwaySwitch, kitchenCans, kitchenPendant, bookcaseGOLamp, bookcaseColorLamp, lrHueLights].each { noteCommand(it, 0, 0) }
 
     unschedule("cansOnDelayed")
     diningSwitch?.off()
