@@ -311,8 +311,7 @@ def initialize() {
     
     // Initialize state
     state.presenceActive = (motionZone.currentMotion == "active")
-    state.overrides = [:]
-    state.manualOverride = false
+    clearOverrides("app restarted")   // also puts the switch LEDs back
     state.tvTimeActive = false
     state.lastAutomationAction = now()
     state.pendingPresenceOff = false
