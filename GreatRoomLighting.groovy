@@ -6,6 +6,9 @@
  *
  *  Author: Claude (for Ashwin)
  *  Date: 2026-02-12
+ *  Version: 1.41 - manual overrides are per light: a physical press takes that light out of the automation until the
+ *                  next scene change or 180 minutes; the rest of the room carries on (a tap on the kitchen cans at
+ *                  06:48 used to freeze everything, so the morning ramp never ran and the room stayed at predawn levels)
  *  Version: 1.40 - a covered or failed outdoor sensor no longer keeps the room lit all day: under 50 lux outdoors with
  *                  the sun up is treated as a sensor fault, Night mode is overruled while the indoor sensors read
  *                  bright, and a warning names the sensor (2026-10-11: covered at 13:57, Night mode for 23 hours)
@@ -52,7 +55,7 @@ preferences {
     page(name: "mainPage")
 }
 
-def appVersion() { return "1.40" }
+def appVersion() { return "1.41" }
 
 def mainPage() {
     dynamicPage(name: "mainPage", title: "Great Room Lighting Controller", install: true, uninstall: true) {
@@ -86,6 +89,7 @@ def mainPage() {
             input "cloudyThreshold", "number", title: "Cloud cover % threshold (turn on if above)", defaultValue: 70, required: true
             input "cloudyLuxThreshold", "number", title: "Outdoor lux threshold for cloudy check", defaultValue: 400, required: true
             input "presenceTimeout", "number", title: "Minutes before presence times out", defaultValue: 8, required: true
+            input "manualOverrideMinutes", "number", title: "A physical switch press takes that one light out of the automation until the next scene change (predawn end, wind-down, mode change, TV time, everyone leaving) or this many minutes, whichever is first (0 = scene changes only)", defaultValue: 180, required: true
             input "lightsOffDelay", "number", title: "Seconds delay before turning lights off", defaultValue: 10, required: true
             input "lrDimDelay", "number", title: "Seconds before LR ceiling dims after leaving the room", defaultValue: 60, required: true
             input "lrBrightHoldMinutes", "number", title: "Minimum minutes LR ceiling stays bright after brightening (anti-flicker)", defaultValue: 3, required: true
@@ -300,6 +304,7 @@ def initialize() {
     
     // Initialize state
     state.presenceActive = (motionZone.currentMotion == "active")
+    state.overrides = [:]
     state.manualOverride = false
     state.tvTimeActive = false
     state.lastAutomationAction = now()
@@ -371,14 +376,14 @@ def delayedInitialEvaluation() {
     }
     
     // If conditions say lights should be ON, turn them on
-    if (state.presenceActive && state.lightNeeded && !state.manualOverride && !state.tvTimeActive) {
+    if (state.presenceActive && state.lightNeeded && !state.tvTimeActive) {
         log.info "Conditions warrant lights on - applying scene"
         if (location.mode == "Night") {
             if (isPredawn()) { applyPredawnScene() } else if (isWindDown()) { applyWindDownScene() } else if (isMorning()) { applyDayScene() } else { applyNightScene() }
         } else {
             applyDayScene()
         }
-    } else if (roomIsOn() && !state.presenceActive && !state.manualOverride && !state.tvTimeActive) {
+    } else if (roomIsOn() && !state.presenceActive && !state.tvTimeActive) {
         // The zone is already quiet and the room is lit: the update cancelled the running presence timeout, so restart it
         // (otherwise the room stays lit until the next motion event, 2026-10-06)
         state.presenceActive = true
@@ -566,12 +571,13 @@ def armPredawnEnd() {
 
 def predawnEnded() {
     // Predawn window just closed - come up gradually (morning ramp) rather than jumping to the full scene
+    clearOverrides("predawn ended")
     if (adaptiveEnabled != false) {
         state.morningRamp = [start: now(), minutes: (morningRampMinutes ?: 30) as Integer]
         log.info "Predawn ended - ramping up over ${morningRampMinutes ?: 30} minutes"
         runIn(180, "morningRampStep")
     }
-    if (state.presenceActive && !state.manualOverride && !state.tvTimeActive) {
+    if (state.presenceActive && !state.tvTimeActive) {
         evaluateLighting("predawn window ended")
     }
 }
@@ -585,7 +591,7 @@ def morningRampStep() {
     } else {
         runIn(180, "morningRampStep")
     }
-    if (state.presenceActive && state.lightNeeded && !state.manualOverride && !state.tvTimeActive && state.currentScene in ["day", "night"]) {
+    if (state.presenceActive && state.lightNeeded && !state.tvTimeActive && state.currentScene in ["day", "night"]) {
         reapplyCurrentScene("morning ramp ${rf}%", (ambientFadeSeconds ?: 45) as Integer)
     }
 }
@@ -601,7 +607,8 @@ def isWindDown() {
 
 def windDownStarted() {
     // Wind-down window just opened - ease the lights down if someone is around
-    if (state.presenceActive && !state.manualOverride && !state.tvTimeActive) {
+    clearOverrides("wind-down started")
+    if (state.presenceActive && !state.tvTimeActive) {
         evaluateLighting("wind-down started")
     }
 }
@@ -728,10 +735,10 @@ def evaluateLightingAfterRefresh() {
     def lightsCurrentlyOn = (diningSwitch?.currentSwitch == "on" || kitchenCans?.currentSwitch == "on")
     def lightNeeded = isLightNeeded()
     
-    if (!lightsCurrentlyOn && lightNeeded && !state.manualOverride && !state.tvTimeActive) {
+    if (!lightsCurrentlyOn && lightNeeded && !state.tvTimeActive) {
         // Lights are off but should be on
         evaluateLighting("motion + indoor lux ${indoorLux}")
-    } else if (lightsCurrentlyOn && !lightNeeded && !state.manualOverride && !state.tvTimeActive) {
+    } else if (lightsCurrentlyOn && !lightNeeded && !state.tvTimeActive) {
         // Lights are on but shouldn't be (unlikely but handle it)
         evaluateLighting("motion + indoor lux ${indoorLux} (too bright)")
     } else {
@@ -767,7 +774,7 @@ def presenceTimedOut() {
     
     state.presenceActive = false
     state.pendingPresenceOff = false
-    state.manualOverride = false  // Clear override when everyone leaves
+    clearOverrides("everyone left")
     evaluateLighting("presence timeout")
 }
 
@@ -807,7 +814,7 @@ def indoorLuxHandler(evt) {
     logDebug "Indoor lux changed: ${who} ${lux} (threshold: ${threshold})"
     
     // If presence is active, check if lighting needs to change
-    if (state.presenceActive && !state.manualOverride && !state.tvTimeActive) {
+    if (state.presenceActive && !state.tvTimeActive) {
         def wasLightNeeded = state.lightNeeded
         state.lightNeeded = isLightNeeded()
         
@@ -860,7 +867,7 @@ def turnOffDueToBright() {
     
     // Verify still bright before turning off (both sensors, same hysteresis as the turn-on decision)
     state.lightNeeded = isLightNeeded()
-    if (!state.lightNeeded && state.presenceActive && !state.manualOverride && !state.tvTimeActive) {
+    if (!state.lightNeeded && state.presenceActive && !state.tvTimeActive) {
         log.info "Still bright after 10 minutes (${indoorReadings()}) - turning off lights"
         safeLogToSheet("indoorLux", lux.toString(), "still bright, turning off", lux)
         evaluateLighting("bright for 10+ minutes")
@@ -876,7 +883,7 @@ def cloudHandler(evt) {
     logDebug "Cloud cover changed: ${cloudiness}% (threshold: ${threshold}%)"
     
     // If presence is active, check if lighting needs to change
-    if (state.presenceActive && !state.manualOverride && !state.tvTimeActive) {
+    if (state.presenceActive && !state.tvTimeActive) {
         def wasLightNeeded = state.lightNeeded
         state.lightNeeded = isLightNeeded()
         
@@ -905,11 +912,11 @@ def outdoorLuxHandler(evt) {
     // Legacy path: only the dining level follows outdoor light
     def newDiningLevel = getDiningLevelForAmbient()
     def lastDiningLevel = state.lastDiningLevel ?: 100
-    if (newDiningLevel != lastDiningLevel && state.presenceActive && state.lightNeeded && !state.manualOverride && !state.tvTimeActive) {
+    if (newDiningLevel != lastDiningLevel && state.presenceActive && state.lightNeeded && !state.tvTimeActive) {
         state.lastDiningLevel = newDiningLevel
         log.info "Outdoor lux ${lux} -> dining level ${newDiningLevel}%"
         safeLogToSheet("ambient", lux.toString(), "dining -> ${newDiningLevel}%", lux)
-        diningSwitch?.setLevel(newDiningLevel)
+        if (!overridden(diningSwitch)) diningSwitch?.setLevel(newDiningLevel)
     }
 }
 
@@ -921,7 +928,7 @@ def tvTimeSwitchHandler(evt) {
         logDebug "Activating TV Time"
         safeLogToSheet("tvTime", "activated", "manual switch", currentLux)
         state.tvTimeActive = true
-        state.manualOverride = false  // Clear override when TV time activates
+        clearOverrides("TV time")
         evaluateLighting("TV Time activated")
     } else {
         logDebug "Deactivating TV Time"
@@ -957,7 +964,7 @@ def livingRoomPresenceHandler(evt) {
     def lightsOn = lrHueLights?.currentSwitch == "on"
 
     // If lights are on and not in override/TV mode, adjust zone levels
-    if (lightsOn && !state.manualOverride && !state.tvTimeActive) {
+    if (lightsOn && !state.tvTimeActive) {
         def currentLux = luxSensor?.currentIlluminance ?: 0
 
         if (evt.value == "active") {
@@ -1022,7 +1029,7 @@ def kzInactiveHandler(evt) {
 def kzDimCheck() {
     if (state.kzDimmed || kzActive()) return
     if (!(state.currentScene in ["day", "night"]) || !roomIsOn()) return
-    if (state.manualOverride || state.tvTimeActive) return
+    if (state.tvTimeActive) return
     Map full = state.kzFull as Map
     if (!full) return
     state.kzDimmed = true
@@ -1040,7 +1047,7 @@ def kzDimCheck() {
 def kzRestore(String reason) {
     state.kzDimmed = false
     if (!(state.currentScene in ["day", "night"]) || !roomIsOn()) return
-    if (state.manualOverride || state.tvTimeActive) return
+    if (state.tvTimeActive) return
     Map full = state.kzFull as Map
     if (!full) return
     state.lastAutomationAction = now()
@@ -1070,7 +1077,7 @@ long pirVetoRemainingMs() {
 def lrMotionHandler(evt) {
     state.lastLrMotionAt = now()
     // The mmWave said the room was empty but the PIR disagrees: bring the ceiling back, then let the normal dim check run again
-    if (state.lrDimmed && lrHueLights?.currentSwitch == "on" && !state.manualOverride && !state.tvTimeActive) {
+    if (state.lrDimmed && lrHueLights?.currentSwitch == "on" && !state.tvTimeActive) {
         log.info "${evt.displayName} saw motion while the LR ceiling was dimmed (mmWave says ${livingRoomPresence?.currentValue('mmwave')}) - brightening"
         unschedule(applyLrDimmed)
         applyLrZoneLevel(true)
@@ -1089,7 +1096,7 @@ def applyLrDimmed() {
     def mmwaveState = livingRoomPresence?.currentValue("mmwave")
     def lightsOn = lrHueLights?.currentSwitch == "on"
 
-    if (mmwaveState != "inactive" || !lightsOn || state.manualOverride || state.tvTimeActive) {
+    if (mmwaveState != "inactive" || !lightsOn || state.tvTimeActive) {
         return
     }
 
@@ -1155,6 +1162,7 @@ def modeHandler(evt) {
     }
 
     // Always re-evaluate when mode changes (this is now our primary trigger)
+    clearOverrides("mode changed to ${evt.value}")
     if (wasNeeded != state.lightNeeded || state.presenceActive) {
         state.modeChangeFade = roomIsOn()
         evaluateLighting("mode changed to ${evt.value}")
@@ -1172,10 +1180,10 @@ def manualSwitchHandler(evt) {
     // Only set manual override if it was a PHYSICAL button press
     // Digital commands from other automations should not trigger override
     if (isPhysical && !state.turningOff) {
-        log.info "Physical switch change detected: ${evt.device.displayName} = ${evt.value}"
+        log.info "Physical switch change detected: ${evt.device.displayName} = ${evt.value} - that light is left alone until the next scene change (${manualOverrideMinutes ?: 180} min at most); the rest of the room carries on"
         def currentLux = luxSensor?.currentIlluminance ?: 0
         safeLogToSheet("manual", evt.value, "${evt.device.displayName} (physical)", currentLux)
-        state.manualOverride = true
+        addOverride(evt.device)
     } else if (timeSinceAutomation > 10000 && !state.turningOff) {
         // Log other automations for debugging but don't set override
         logDebug "Other automation changed: ${evt.device.displayName} = ${evt.value}"
@@ -1184,6 +1192,51 @@ def manualSwitchHandler(evt) {
     } else {
         logDebug "Ignoring switch change (our automation): ${evt.device.displayName} = ${evt.value}"
     }
+}
+
+// ==================== MANUAL OVERRIDES (per device) ====================
+// A physical press used to freeze the whole automation until the house emptied: a tap on the kitchen cans at 06:48
+// stopped the morning ramp and the room stayed at predawn levels (2026-10-13). Now a press takes only that device out
+// of the automation; the rest of the room carries on. The device returns at the next scene transition (predawn end,
+// wind-down, a mode change, TV time, everyone leaving) or after manualOverrideMinutes, whichever comes first.
+
+void addOverride(dev) {
+    if (!dev) return
+    Map o = (state.overrides ?: [:]) as Map
+    Integer mins = (manualOverrideMinutes ?: 180) as Integer
+    o[dev.id.toString()] = mins > 0 ? now() + mins * 60000L : 4102444800000L
+    state.overrides = o
+    state.manualOverride = true
+}
+
+/** True while this device is under a manual override; an expired one is dropped on the way through. */
+boolean overridden(dev) {
+    if (!dev) return false
+    Map o = (state.overrides ?: [:]) as Map
+    def until = o[dev.id.toString()]
+    if (until == null) return false
+    if ((until as Long) <= now()) {
+        o.remove(dev.id.toString())
+        state.overrides = o
+        state.manualOverride = !o.isEmpty()
+        log.info "${dev.displayName}: manual override expired - back under automation"
+        return false
+    }
+    return true
+}
+
+void clearOverrides(String reason) {
+    Map o = (state.overrides ?: [:]) as Map
+    if (o) log.info "Manual overrides cleared (${reason}): ${overrideText()}"
+    state.overrides = [:]
+    state.manualOverride = false
+}
+
+String overrideText() {
+    Map o = (state.overrides ?: [:]) as Map
+    if (!o) return "none"
+    def all = [diningSwitch, hallwaySwitch, kitchenPendant, kitchenCans, lrHueLights, bookcaseGOLamp, bookcaseColorLamp].findAll { it }
+    return o.keySet().collect { id -> all.find { it.id.toString() == id }?.displayName ?: "device ${id}" }.join(", ")
 }
 
 // ==================== MAIN LOGIC ====================
@@ -1199,13 +1252,7 @@ def evaluateLighting(String reason) {
     state.lightNeeded = isLightNeeded()
     
     logDebug "Evaluating lighting (${reason})"
-    logDebug "  State: presence=${state.presenceActive}, lightNeeded=${state.lightNeeded}, override=${state.manualOverride}, tvTime=${state.tvTimeActive}, mode=${location.mode}"
-    
-    // Check manual override
-    if (state.manualOverride) {
-        logDebug "Manual override active - skipping automation"
-        return
-    }
+    logDebug "  State: presence=${state.presenceActive}, lightNeeded=${state.lightNeeded}, overrides=${overrideText()}, tvTime=${state.tvTimeActive}, mode=${location.mode}"
     
     // No one present? Turn everything off
     if (!state.presenceActive) {
@@ -1384,6 +1431,7 @@ boolean cansWanted(Integer factor) {
 
 def setCans(boolean on) {
     if (!kitchenCans) return
+    if (overridden(kitchenCans)) { logDebug "${kitchenCans.displayName}: manual override - left alone"; return }
     if (on && kitchenCans.currentSwitch != "on") kitchenCans.on()
     else if (!on) {
         unschedule("cansOnDelayed")
@@ -1402,7 +1450,7 @@ def applyCans(boolean on, Integer fade) {
 
 def cansOnDelayed() {
     if (!(state.currentScene in ["day", "night"]) || !roomIsOn()) return
-    if (state.manualOverride || state.tvTimeActive) return
+    if (state.tvTimeActive) return
     if (cansWanted((state.lastFactor ?: 100) as Integer)) setCans(true)
 }
 
@@ -1430,6 +1478,7 @@ Integer sceneFade(Number override) {
 /** setLevel with a transition where the driver takes one (all the dimmers and Hue devices here do). */
 def setLevelSmooth(dev, Number level, Number seconds) {
     if (!dev) return
+    if (overridden(dev)) { logDebug "${dev.displayName}: manual override - left alone"; return }
     Integer lvl = Math.max(0, Math.min(100, (level ?: 0) as Integer))
     Integer sec = Math.max(0, (seconds ?: 0) as Integer)
     try {
@@ -1443,7 +1492,7 @@ def setLevelSmooth(dev, Number level, Number seconds) {
 /** Re-apply the current day/night scene when the ambient band changes while the room is on. */
 def ambientStep(String reason) {
     if (adaptiveEnabled == false || appPaused) return
-    if (!(state.presenceActive && state.lightNeeded && !state.manualOverride && !state.tvTimeActive)) return
+    if (!(state.presenceActive && state.lightNeeded && !state.tvTimeActive)) return
     if (!(state.currentScene in ["day", "night"]) || !roomIsOn()) return
     Integer before = (state.ambientFactor ?: 100) as Integer
     Integer after = ambientFactor()
@@ -1462,7 +1511,7 @@ def ambientRecheck() {
  * same 10-minute debounce the handlers use.
  */
 def brightRoomSafetyNet() {
-    if (appPaused || !roomIsOn() || !state.presenceActive || state.manualOverride || state.tvTimeActive || state.pendingBrightOff) return
+    if (appPaused || !roomIsOn() || !state.presenceActive || state.tvTimeActive || state.pendingBrightOff) return
     state.lightNeeded = isLightNeeded()
     if (state.lightNeeded) return
     state.pendingBrightOff = true
@@ -1496,7 +1545,7 @@ Integer darkRoomDebounceMinutes() {
 def confirmDarkRoom() {
     state.pendingDarkOn = false
     state.lightNeeded = isLightNeeded()
-    if (state.lightNeeded && state.presenceActive && !state.manualOverride && !state.tvTimeActive) {
+    if (state.lightNeeded && state.presenceActive && !state.tvTimeActive) {
         // The room has proven it is dark: the "still bright outside" 35% band would barely register, so hold a floor until the room turns off
         state.factorFloor = (darkRoomMinFactor ?: 55) as Integer
         log.info "Dark room held for ${state.pendingDarkMins ?: daytimeOnDebounceMinutes ?: 10} minutes - turning on lights (factor floor ${state.factorFloor}%)"
@@ -1515,7 +1564,8 @@ String adaptiveStatus() {
     String fault = outdoorSensorImplausible() ? " <b>(implausible with the sun up: sensor covered or faulty, overruled)</b>" : ""
     return "Outdoor ${lux != null ? lux + ' lux' : 'sensor missing'}${fault}: band ${rawAmbientFactor()}%, applied factor ${state.ambientFactor ?: '-'}%${floor}; " +
            "${ramp}; predawn ends ${predawnAt} today; scene now: ${state.currentScene ?: 'off'}; " +
-           "cans ${cansWanted((state.lastFactor ?: state.ambientFactor ?: 100) as Integer) ? 'allowed' : 'held off'} (from a ${cansFactor ?: 75}% factor)"
+           "cans ${cansWanted((state.lastFactor ?: state.ambientFactor ?: 100) as Integer) ? 'allowed' : 'held off'} (from a ${cansFactor ?: 75}% factor); " +
+           "manual overrides: ${overrideText()}"
 }
 
 // ==================== SCENE ACTIONS ====================
@@ -1641,7 +1691,7 @@ def applyPredawnScene() {
 
     // Gentle wake: low warm light only - dining Edisons and kitchen cans stay off
     Integer fade = sceneFade(null)
-    diningSwitch?.off()
+    if (!overridden(diningSwitch)) diningSwitch?.off()
     setLevelSmooth(hallwaySwitch, predawnHallwayLevel ?: 20, fade)
     setCans(false)
     setLevelSmooth(kitchenPendant, predawnKitchenPendantLevel ?: 10, fade)
@@ -1738,7 +1788,8 @@ def turnAllLightsOff() {
     state.lastAutomationAction = now()
     state.turningOff = true
     def currentLux = luxSensor?.currentIlluminance ?: 0
-    
+    clearOverrides("room turning off")
+
     unschedule("cansOnDelayed")
     diningSwitch?.off()
     hallwaySwitch?.off()
