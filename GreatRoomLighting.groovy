@@ -1187,21 +1187,25 @@ def manualSwitchHandler(evt) {
     logDebug "Change: ${dev.displayName} ${evt.name}=${evt.value} (${isPhysical ? 'physical' : 'digital'}), now ${nowLevel}%, commanded ${cmd?.level}% until ${cmd?.until}"
 
     if (!isPhysical) {
-        // Hue app, dashboard or another app: counts as manual only when it is clearly not our own command or its echo
+        // Hue app, dashboard or another app: counts as manual only when it is clearly not our own command or its echo.
+        // A light already under manual control, or pressed in the last 30 s, gets no commands from us, so anything
+        // that happens to it is a person (that is how a second press that puts it back gets seen).
         if (appChangesAreManual == false || state.tvTimeActive) return
-        long until = (cmd?.until ?: 0L) as Long
-        if (now() < until || now() - ((state.lastAutomationAction ?: 0L) as Long) < 90000L) {
-            logDebug "${dev.displayName}: our own command (or its echo) - ignored"
-            return
+        if (!overridden(dev) && !recentPress(dev)) {
+            long until = (cmd?.until ?: 0L) as Long
+            if (now() < until || now() - ((state.lastAutomationAction ?: 0L) as Long) < 90000L) {
+                logDebug "${dev.displayName}: our own command (or its echo) - ignored"
+                return
+            }
+            if (cmd?.level == null) { logDebug "${dev.displayName}: no commanded level on record - ignored"; return }
+            Integer expected = cmd.level as Integer
+            boolean onOffChange = (expected == 0) != (nowLevel == 0)
+            if (!onOffChange && Math.abs(nowLevel - expected) < 10) {
+                logDebug "${dev.displayName}: ${nowLevel}% vs commanded ${expected}% - drift, ignored"
+                return
+            }
         }
-        if (cmd?.level == null) { logDebug "${dev.displayName}: no commanded level on record - ignored"; return }
-        Integer expected = cmd.level as Integer
-        boolean onOffChange = (expected == 0) != (nowLevel == 0)
-        if (!onOffChange && Math.abs(nowLevel - expected) < 10) {
-            logDebug "${dev.displayName}: ${nowLevel}% vs commanded ${expected}% - drift, ignored"
-            return
-        }
-        log.info "${dev.displayName} changed outside the automation (app or dashboard): ${nowLevel == 0 ? 'off' : nowLevel + '%'} vs commanded ${expected == 0 ? 'off' : expected + '%'}"
+        log.info "${dev.displayName} changed outside the automation (app or dashboard): ${nowLevel == 0 ? 'off' : nowLevel + '%'} vs commanded ${cmd?.level == null ? '?' : (cmd.level == 0 ? 'off' : cmd.level + '%')}"
     } else {
         log.info "Physical switch change detected: ${dev.displayName} ${evt.name} = ${evt.value}"
     }
@@ -1228,8 +1232,7 @@ void handleManualChange(dev, Integer nowLevel, Integer expectedLevel) {
     // the switch and level events of one tap arrive together (and a hold reports as it goes): count them once
     boolean samePress = times && (t - times[-1]) < 3000L
     if (!samePress) times << t
-    Integer from = (times.size() == 1 || p.from == null) ? (expectedLevel != null ? expectedLevel : nowLevel) : (p.from as Integer)
-    presses[id] = [times: times, from: from, at: t]
+    presses[id] = [times: times, at: t]
     state.presses = presses
 
     if (times.size() >= 3) {
@@ -1239,11 +1242,13 @@ void handleManualChange(dev, Integer nowLevel, Integer expectedLevel) {
         runIn(20, "restoreAfterPlay")
         return
     }
-    if (times.size() == 2 && nowLevel == from) {
+    // Back where the automation put it (a tap undone, or an app change reverted): no override, whenever it happens
+    if (expectedLevel != null && nowLevel == expectedLevel) {
         dropOverride(dev)
-        log.info "${dev.displayName}: pressed and put back within ${((t - times[0]) / 1000) as Integer} s - treated as nothing happened"
+        log.info "${dev.displayName}: put back to what the automation set${times.size() > 1 ? ' within ' + (((t - times[0]) / 1000) as Integer) + ' s' : ''} - treated as nothing happened"
         return
     }
+    Integer from = expectedLevel != null ? expectedLevel : nowLevel
     if (state.morningRamp && rampFactor() < 100 && nowLevel > from) {
         Map floors = (state.rampFloor ?: [:]) as Map
         floors[id] = nowLevel
@@ -1259,6 +1264,12 @@ void handleManualChange(dev, Integer nowLevel, Integer expectedLevel) {
 def restoreAfterPlay() {
     if (!state.presenceActive) return
     evaluateLighting("after play")
+}
+
+/** A manual change on this light within the last 30 s (the revert and play rules look back that far). */
+boolean recentPress(dev) {
+    Map p = ((state.presses ?: [:]) as Map)[dev.id.toString()] as Map
+    return p?.at != null && now() - (p.at as Long) < 30000L
 }
 
 /** The light's level as a person sees it: 0 when off, else its level (100 for a plain switch). */
