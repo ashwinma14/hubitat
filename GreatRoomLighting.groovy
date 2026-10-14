@@ -6,6 +6,9 @@
  *
  *  Author: Claude (for Ashwin)
  *  Date: 2026-02-12
+ *  Version: 1.43 - the kitchen cans are a dimmer now (Zooz ZEN77 replaced the ZEN71 on 2026-10-14): they take a level
+ *                  per scene, scale with the factor, fade with the room, dim with the kitchen zone and hold up with the
+ *                  rest; an on/off switch in that slot still joins at the cans factor like before
  *  Version: 1.42 - manual changes, as the house asked (survey 2026-10-13): a press put back within 10 s is nothing;
  *                  three presses in 30 s is play, the light is put back after 20 s; a brighter press during the morning
  *                  ramp is a floor the ramp continues from; Hue-app and dashboard changes count as manual (not our own
@@ -59,7 +62,7 @@ preferences {
     page(name: "mainPage")
 }
 
-def appVersion() { return "1.42" }
+def appVersion() { return "1.43" }
 
 def mainPage() {
     dynamicPage(name: "mainPage", title: "Great Room Lighting Controller", install: true, uninstall: true) {
@@ -77,7 +80,7 @@ def mainPage() {
             input "luxSensor", "capability.illuminanceMeasurement", title: "Lux Sensor (for logging only)", required: false
             input "diningSwitch", "capability.switch", title: "Dining Switch", required: true
             input "hallwaySwitch", "capability.switchLevel", title: "Hallway Switch", required: true
-            input "kitchenCans", "capability.switch", title: "Kitchen Cans", required: true
+            input "kitchenCans", "capability.switch", title: "Kitchen Cans (a dimmer follows the scene levels below; an on/off switch joins above the cans factor)", required: true
             input "kitchenPendant", "capability.switchLevel", title: "Kitchen Pendant", required: true
             input "bookcaseGOLamp", "capability.switchLevel", title: "Bookcase GO Lamp", required: true
             input "bookcaseColorLamp", "capability.switchLevel", title: "Bookcase Color Lamp", required: true
@@ -123,6 +126,7 @@ def mainPage() {
             input "dayKitchenPendantLevel", "number", title: "Kitchen Pendant brightness", defaultValue: 100
             input "dayBookcaseLevel", "number", title: "Bookcase lamps brightness", defaultValue: 50
             input "dayHueLevel", "number", title: "LR Hue lights brightness", defaultValue: 100
+            input "dayCansLevel", "number", title: "Kitchen cans brightness (dimmer)", defaultValue: 100
         }
         
         section("<b>Scene Settings - Night Mode</b>") {
@@ -130,6 +134,7 @@ def mainPage() {
             input "nightKitchenPendantLevel", "number", title: "Kitchen Pendant brightness", defaultValue: 30
             input "nightBookcaseLevel", "number", title: "Bookcase lamps brightness", defaultValue: 15
             input "nightHueLevel", "number", title: "LR Hue lights brightness", defaultValue: 80
+            input "nightCansLevel", "number", title: "Kitchen cans brightness (dimmer)", defaultValue: 60
         }
         
         section("<b>Scene Settings - Predawn (gentle wake)</b>") {
@@ -138,6 +143,7 @@ def mainPage() {
             input "predawnKitchenPendantLevel", "number", title: "Kitchen Pendant brightness", defaultValue: 10
             input "predawnBookcaseLevel", "number", title: "Bookcase lamps brightness", defaultValue: 10
             input "predawnHueLevel", "number", title: "LR Hue lights brightness", defaultValue: 30
+            input "predawnCansLevel", "number", title: "Kitchen cans brightness (dimmer; 0 = off)", defaultValue: 0
         }
 
         section("<b>Scene Settings - Wind-down (evening)</b>") {
@@ -147,6 +153,7 @@ def mainPage() {
             input "windDownKitchenPendantLevel", "number", title: "Kitchen Pendant brightness", defaultValue: 15
             input "windDownBookcaseLevel", "number", title: "Bookcase lamps brightness", defaultValue: 10
             input "windDownHueLevel", "number", title: "LR Hue lights brightness", defaultValue: 50
+            input "windDownCansLevel", "number", title: "Kitchen cans brightness (dimmer; 0 = off)", defaultValue: 0
         }
 
         section("<b>Scene Settings - TV Time</b>") {
@@ -160,7 +167,7 @@ def mainPage() {
             input "adaptiveLux55", "number", title: "Outdoor lux below which levels run at 55%", defaultValue: 400, required: true, width: 4
             input "adaptiveLux75", "number", title: "Outdoor lux below which levels run at 75%", defaultValue: 150, required: true, width: 4
             input "adaptiveLux100", "number", title: "Outdoor lux below which levels run at 100%", defaultValue: 50, required: true, width: 4
-            input "cansFactor", "number", title: "Kitchen cans (on/off only) join once the factor reaches this percent", defaultValue: 75, required: true, width: 6
+            input "cansFactor", "number", title: "Kitchen cans stay off below this factor (0 = a dimmer always follows the room; an on/off switch joins at this factor)", defaultValue: 0, required: true, width: 6
             input "ambientStepMinutes", "number", title: "Minimum minutes between ambient steps", defaultValue: 10, required: true, width: 6
             input "turnOnFadeSeconds", "number", title: "Fade-in when the room turns on (seconds)", defaultValue: 60, required: true, width: 4
             input "ambientFadeSeconds", "number", title: "Fade for ambient steps (seconds)", defaultValue: 45, required: true, width: 4
@@ -171,7 +178,7 @@ def mainPage() {
             input "duskLuxThreshold", "number", title: "...but once outdoor lux is below this, use the shorter dusk debounce", defaultValue: 1000, required: true, width: 4
             input "duskDebounceMinutes", "number", title: "Dusk debounce (minutes)", defaultValue: 3, required: true, width: 4
             input "darkRoomMinFactor", "number", title: "When the room turned on because it measured dark, never run below this factor (%) until it turns off", defaultValue: 55, required: true
-            paragraph "Dining runs 50% / 75% / 100% as the factor reaches 55 / 75 / 100. While the factor is rising (dusk, morning ramp) the living room, hallway and dining never step down; when it is falling (a brightening morning) it steps down one band at a time, at most one step per the interval above."
+            paragraph "Dining runs 50% / 75% / 100% as the factor reaches 55 / 75 / 100; the cans (a dimmer since 2026-10-14) scale with the factor like the pendants. While the factor is rising (dusk, morning ramp) the living room, hallway and dining never step down; when it is falling (a brightening morning) it steps down one band at a time, at most one step per the interval above."
             paragraph adaptiveStatus()
         }
 
@@ -1047,8 +1054,9 @@ def kzDimCheck() {
     setLevelSmooth(hallwaySwitch, h, 5)
     setLevelSmooth(kitchenPendant, p, 5)
     setLevelSmooth(diningSwitch, d, 5)
-    setCans(false)
-    log.info "Kitchen zone quiet for ${kzDimMinutes ?: 5} min - dimmed (hallway ${h}%, pendant ${p}%, dining ${d}%, cans off); living room ${livingRoomOccupied() ? 'occupied' : 'empty'}"
+    Integer c = kzCansDim(cansFromFull(full.cans))
+    applyCansLevel(c, 5)
+    log.info "Kitchen zone quiet for ${kzDimMinutes ?: 5} min - dimmed (hallway ${h}%, pendant ${p}%, dining ${d}%, cans ${cansText(c)}); living room ${livingRoomOccupied() ? 'occupied' : 'empty'}"
 }
 
 def kzRestore(String reason) {
@@ -1061,8 +1069,27 @@ def kzRestore(String reason) {
     setLevelSmooth(hallwaySwitch, full.hallway as Integer, 5)
     setLevelSmooth(kitchenPendant, full.pendant as Integer, 5)
     setLevelSmooth(diningSwitch, full.dining as Integer, 5)
-    if (full.cans) setCans(true)
-    log.info "Kitchen zone active (${reason}) - restored (hallway ${full.hallway}%, pendant ${full.pendant}%, dining ${full.dining}%, cans ${full.cans ? 'on' : 'off'})"
+    Integer c = cansFromFull(full.cans)
+    applyCansLevel(c, 5)
+    log.info "Kitchen zone active (${reason}) - restored (hallway ${full.hallway}%, pendant ${full.pendant}%, dining ${full.dining}%, cans ${cansText(c)})"
+}
+
+/** The cans while the kitchen zone is quiet: a dimmer dims like the hallway, an on/off switch goes off. */
+Integer kzCansDim(Integer full) {
+    if (!full || full <= 0) return 0
+    return cansDimmable() ? kzDimOf(full) : 0
+}
+
+/** kzFull.cans was a boolean before v1.43; read either shape. */
+Integer cansFromFull(def v) {
+    if (v == null) return 0
+    if (v instanceof Boolean) return v ? 100 : 0
+    return (v as Integer)
+}
+
+String cansText(Integer level) {
+    if (!level || level <= 0) return "off"
+    return cansDimmable() ? "${level}%" : "on"
 }
 
 Integer kzDimOf(Integer full) {
@@ -1555,11 +1582,33 @@ Integer scaled(Number base) {
     return Math.min(100, Math.max(Math.min(10, b), v))
 }
 
-/** The cans are on/off only, so they join once the effective factor reaches cansFactor (default 75%) and drop out below it. */
+/** The cans join once the effective factor reaches cansFactor; 0 means always (a dimmer scales with the room instead). */
 boolean cansWanted(Integer factor) {
     if (adaptiveEnabled == false) return true
     if (factor == null) return true
-    return factor >= ((cansFactor ?: 75) as Integer)
+    return factor >= ((cansFactor ?: 0) as Integer)
+}
+
+boolean cansDimmable() {
+    return kitchenCans?.hasCommand("setLevel")
+}
+
+/** A scene's cans level: the scaled base when the cans are wanted, else 0. An on/off switch reads any level above 0 as "on". */
+Integer cansLevelFor(Integer factor, Number base) {
+    if (!kitchenCans) return 0
+    Integer b = (base ?: 0) as Integer
+    if (b <= 0 || !cansWanted(factor)) return 0
+    return cansDimmable() ? scaled(b) : 100
+}
+
+/** Put the cans at a level: a dimmer fades like the rest of the room; an on/off switch joins at the end of the fade. */
+def applyCansLevel(Integer level, Integer fade) {
+    if (!kitchenCans) return
+    Integer lvl = Math.max(0, Math.min(100, (level ?: 0) as Integer))
+    if (!cansDimmable()) { applyCans(lvl > 0, fade); return }
+    if (lvl <= 0) { setCans(false); return }
+    unschedule("cansOnDelayed")
+    setLevelSmooth(kitchenCans, lvl, fade)
 }
 
 def setCans(boolean on) {
@@ -1699,7 +1748,7 @@ String adaptiveStatus() {
     String fault = outdoorSensorImplausible() ? " <b>(implausible with the sun up: sensor covered or faulty, overruled)</b>" : ""
     return "Outdoor ${lux != null ? lux + ' lux' : 'sensor missing'}${fault}: band ${rawAmbientFactor()}%, applied factor ${state.ambientFactor ?: '-'}%${floor}; " +
            "${ramp}; predawn ends ${predawnAt} today; scene now: ${state.currentScene ?: 'off'}; " +
-           "cans ${cansWanted((state.lastFactor ?: state.ambientFactor ?: 100) as Integer) ? 'allowed' : 'held off'} (from a ${cansFactor ?: 75}% factor); " +
+           "cans ${cansDimmable() ? 'dim with the room' : 'on/off'}${((cansFactor ?: 0) as Integer) > 0 ? ' from a ' + cansFactor + '% factor' : ''}; " +
            "manual overrides: ${overrideText()}"
 }
 
@@ -1724,19 +1773,19 @@ def applyDayScene(Number fadeOverride = null) {
 
     // Dining Edisons step 50 / 75 / 100 with the factor; a light brightened mid-ramp keeps its floor
     Integer diningLevel = floored(diningSwitch, diningLevelFor(factor))
-    boolean cansOn = cansWanted(factor) || floored(kitchenCans, 0) > 0
-    state.kzFull = [hallway: hallwayLevel, pendant: pendantLevel, dining: diningLevel, cans: cansOn]
+    Integer cansLevel = floored(kitchenCans, cansLevelFor(factor, dayCansLevel ?: 100))
+    state.kzFull = [hallway: hallwayLevel, pendant: pendantLevel, dining: diningLevel, cans: cansLevel]
 
     // Kitchen zone still quiet: keep it dimmed through this re-apply
     boolean kzDim = state.kzDimmed && !kzActive()
-    if (kzDim) { hallwayLevel = kzDimOf(hallwayLevel); pendantLevel = kzDimOf(pendantLevel); diningLevel = (kzDiningDim ?: 30) as Integer; cansOn = false } else { state.kzDimmed = false }
+    if (kzDim) { hallwayLevel = kzDimOf(hallwayLevel); pendantLevel = kzDimOf(pendantLevel); diningLevel = (kzDiningDim ?: 30) as Integer; cansLevel = kzCansDim(cansLevel) } else { state.kzDimmed = false }
 
-    logDebug "Day scene: factor=${factor}%, fade=${fade}s, LR occupied=${lrOccupied}, lrLevel=${lrLevel}, diningLevel=${diningLevel}, cans=${cansOn}, kzDim=${kzDim}"
+    logDebug "Day scene: factor=${factor}%, fade=${fade}s, LR occupied=${lrOccupied}, lrLevel=${lrLevel}, diningLevel=${diningLevel}, cans=${cansLevel}, kzDim=${kzDim}"
 
     // Kitchen/Hallway zone
     setLevelSmooth(diningSwitch, diningLevel, fade)
     setLevelSmooth(hallwaySwitch, hallwayLevel, fade)
-    applyCans(cansOn, fade)
+    applyCansLevel(cansLevel, fade)
     setLevelSmooth(kitchenPendant, pendantLevel, fade)
     
     // Living Room zone - only ceiling dims when unoccupied, bookcase stays constant
@@ -1753,9 +1802,9 @@ def applyDayScene(Number fadeOverride = null) {
     activatorSwitch?.on()
     state.currentScene = "day"
     state.lastFactor = factor
-    rememberLevels([lr: lrLevel, hallway: state.kzFull.hallway, dining: state.kzFull.dining])
+    rememberLevels([lr: lrLevel, hallway: state.kzFull.hallway, dining: state.kzFull.dining, cans: state.kzFull.cans])
 
-    log.info "Day scene applied (factor ${factor}%, fade ${fade}s${kzDim ? ', kitchen zone dimmed' : ''}, LR ${lrOccupied ? 'occupied' : 'unoccupied'} ${lrLevel}%, hallway ${hallwayLevel}%, dining ${diningLevel}%, cans ${cansOn ? 'on' : 'off'})"
+    log.info "Day scene applied (factor ${factor}%, fade ${fade}s${kzDim ? ', kitchen zone dimmed' : ''}, LR ${lrOccupied ? 'occupied' : 'unoccupied'} ${lrLevel}%, hallway ${hallwayLevel}%, dining ${diningLevel}%, cans ${cansText(cansLevel)})"
     safeLogToSheet("scene", "Day", "factor ${factor}% LR ${lrLevel}% dining ${diningLevel}%", currentLux)
 }
 
@@ -1778,19 +1827,19 @@ def applyNightScene(Number fadeOverride = null) {
     Integer hallwayLevel = holdUp(scaled(nightHallwayLevel ?: 80), "hallway", hold)
     Integer pendantLevel = scaled(nightKitchenPendantLevel ?: 30)
     Integer diningLevel = holdUp(diningLevelFor(factor), "dining", hold)
-    boolean cansOn = cansWanted(factor)
-    state.kzFull = [hallway: hallwayLevel, pendant: pendantLevel, dining: diningLevel, cans: cansOn]
+    Integer cansLevel = holdUp(cansLevelFor(factor, nightCansLevel ?: 60), "cans", hold)
+    state.kzFull = [hallway: hallwayLevel, pendant: pendantLevel, dining: diningLevel, cans: cansLevel]
 
     // Kitchen zone still quiet: keep it dimmed through this re-apply
     boolean kzDim = state.kzDimmed && !kzActive()
-    if (kzDim) { hallwayLevel = kzDimOf(hallwayLevel); pendantLevel = kzDimOf(pendantLevel); diningLevel = (kzDiningDim ?: 30) as Integer; cansOn = false } else { state.kzDimmed = false }
+    if (kzDim) { hallwayLevel = kzDimOf(hallwayLevel); pendantLevel = kzDimOf(pendantLevel); diningLevel = (kzDiningDim ?: 30) as Integer; cansLevel = kzCansDim(cansLevel) } else { state.kzDimmed = false }
 
-    logDebug "Night scene: factor=${factor}%, fade=${fade}s, hold=${hold}, LR occupied=${lrOccupied}, lrLevel=${lrLevel}, hallway=${hallwayLevel}, diningLevel=${diningLevel}, cans=${cansOn}, kzDim=${kzDim}"
+    logDebug "Night scene: factor=${factor}%, fade=${fade}s, hold=${hold}, LR occupied=${lrOccupied}, lrLevel=${lrLevel}, hallway=${hallwayLevel}, diningLevel=${diningLevel}, cans=${cansLevel}, kzDim=${kzDim}"
 
     // Kitchen/Hallway zone
     setLevelSmooth(diningSwitch, diningLevel, fade)
     setLevelSmooth(hallwaySwitch, hallwayLevel, fade)
-    applyCans(cansOn, fade)
+    applyCansLevel(cansLevel, fade)
     setLevelSmooth(kitchenPendant, pendantLevel, fade)
     
     // Living Room zone - only ceiling dims when unoccupied, bookcase stays constant
@@ -1807,9 +1856,9 @@ def applyNightScene(Number fadeOverride = null) {
     activatorSwitch?.on()
     state.currentScene = "night"
     state.lastFactor = factor
-    rememberLevels([lr: lrLevel, hallway: state.kzFull.hallway, dining: state.kzFull.dining])
+    rememberLevels([lr: lrLevel, hallway: state.kzFull.hallway, dining: state.kzFull.dining, cans: state.kzFull.cans])
 
-    log.info "Night scene applied (factor ${factor}%, fade ${fade}s${hold ? ', hold' : ''}${kzDim ? ', kitchen zone dimmed' : ''}, LR ${lrOccupied ? 'occupied' : 'unoccupied'} ${lrLevel}%, hallway ${hallwayLevel}%, dining ${diningLevel}%, cans ${cansOn ? 'on' : 'off'})"
+    log.info "Night scene applied (factor ${factor}%, fade ${fade}s${hold ? ', hold' : ''}${kzDim ? ', kitchen zone dimmed' : ''}, LR ${lrOccupied ? 'occupied' : 'unoccupied'} ${lrLevel}%, hallway ${hallwayLevel}%, dining ${diningLevel}%, cans ${cansText(cansLevel)})"
     safeLogToSheet("scene", "Night", "factor ${factor}% LR ${lrLevel}% dining ${diningLevel}%", currentLux)
 }
 
@@ -1828,7 +1877,7 @@ def applyPredawnScene() {
     Integer fade = sceneFade(null)
     if (!overridden(diningSwitch)) diningSwitch?.off()
     setLevelSmooth(hallwaySwitch, predawnHallwayLevel ?: 20, fade)
-    setCans(false)
+    applyCansLevel(cansDimmable() ? ((predawnCansLevel ?: 0) as Integer) : 0, fade)
     setLevelSmooth(kitchenPendant, predawnKitchenPendantLevel ?: 10, fade)
     setLevelSmooth(bookcaseGOLamp, predawnBookcaseLevel ?: 10, fade)
     setLevelSmooth(bookcaseColorLamp, predawnBookcaseLevel ?: 10, fade)
@@ -1858,11 +1907,11 @@ def applyWindDownScene() {
         state.lastLrBrightenTime = now()
     }
 
-    // Ease toward bedtime: dimmer and warmer everywhere, over 30 s - kitchen cans off (not dimmable)
+    // Ease toward bedtime: dimmer and warmer everywhere, over 30 s; the cans dim too (or go off, the default)
     Integer fade = roomIsOn() ? 30 : sceneFade(null)
     setLevelSmooth(diningSwitch, windDownDiningLevel ?: 30, fade)
     setLevelSmooth(hallwaySwitch, windDownHallwayLevel ?: 40, fade)
-    setCans(false)
+    applyCansLevel(cansDimmable() ? ((windDownCansLevel ?: 0) as Integer) : 0, fade)
     setLevelSmooth(kitchenPendant, windDownKitchenPendantLevel ?: 15, fade)
     setLevelSmooth(bookcaseGOLamp, windDownBookcaseLevel ?: 10, fade)
     setLevelSmooth(bookcaseColorLamp, windDownBookcaseLevel ?: 10, fade)
