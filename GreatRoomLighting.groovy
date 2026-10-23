@@ -6,6 +6,11 @@
  *
  *  Author: Claude (for Ashwin)
  *  Date: 2026-02-12
+ *  Version: 1.44 - no more on/off loop on a bright, flickering day (2026-10-23): the bookcase sensor's reading only
+ *                  counts while the lights are off (the room's own light adds ~40 points to it); the kitchen sensor has
+ *                  to read daylight (150 lux) before a lit room may turn off; the bookcase cannot turn the room on while
+ *                  the kitchen is at daylight; the 3-minute dusk debounce applies only in the last 90 minutes before
+ *                  sunset, the 10-minute one otherwise (one bad reading lives up to 5 minutes)
  *  Version: 1.43 - the kitchen cans are a dimmer now (Zooz ZEN77 replaced the ZEN71 on 2026-10-14): they take a level
  *                  per scene, scale with the factor, fade with the room, dim with the kitchen zone and hold up with the
  *                  rest; an on/off switch in that slot still joins at the cans factor like before
@@ -62,7 +67,7 @@ preferences {
     page(name: "mainPage")
 }
 
-def appVersion() { return "1.43" }
+def appVersion() { return "1.44" }
 
 def mainPage() {
     dynamicPage(name: "mainPage", title: "Great Room Lighting Controller", install: true, uninstall: true) {
@@ -91,8 +96,9 @@ def mainPage() {
         section("<b>Mode Settings</b>") {
             paragraph "Lights turn ON when mode is Night or Evening, OR when indoor lux is below threshold, OR when it's cloudy."
             paragraph "Configure your Mode Manager to change modes based on outdoor lux sensor thresholds."
-            input "indoorLuxThreshold", "number", title: "Indoor lux threshold (turn on lights if below)", defaultValue: 15, required: true
-            input "indoorLuxThreshold2", "number", title: "Second indoor sensor: turn on lights if below (lux)", defaultValue: 40, required: true
+            input "indoorLuxThreshold", "number", title: "Living-room sensor (percentage): turn on when below this with the lights off; with them on it only ever says dark, never bright", defaultValue: 50, required: true, width: 4
+            input "indoorLuxThreshold2", "number", title: "Kitchen sensor (lux): turn on when below", defaultValue: 40, required: true, width: 4
+            input "indoorBrightLux2", "number", title: "Kitchen sensor (lux): daylight level - the room may turn off once it reads this with the lights on, and the living-room sensor cannot turn it on above this", defaultValue: 150, required: true, width: 4
             input "cloudyThreshold", "number", title: "Cloud cover % threshold (turn on if above)", defaultValue: 70, required: true
             input "cloudyLuxThreshold", "number", title: "Outdoor lux threshold for cloudy check", defaultValue: 400, required: true
             input "presenceTimeout", "number", title: "Minutes before presence times out", defaultValue: 8, required: true
@@ -425,12 +431,16 @@ def isLightNeeded() {
     
     def modeNeedsLight = (location.mode == "Night" || location.mode == "Evening")
     
-    // Indoor lux check with hysteresis to prevent feedback loop: each sensor turns ON below its threshold and
-    // counts as still-dark below threshold + 30 while the lights are on (the lights add ~20 to the reading).
-    // Two sensors vote; the room is dark when EITHER says so (the bookcase ZSE40 caps at 100% and can sit there silent for hours).
+    // Two indoor sensors vote. The kitchen Hue sensor reads real lux: dark below its threshold, and once the lights are on
+    // it has to read real daylight (the bright level) before the room may turn off, so the pendants' own light cannot
+    // end the night. The bookcase ZSE40 reads a capped percentage that the living-room lights push up by ~40 points,
+    // so with the lights on it only counts when it still reads dark; it never gets to say "bright".
+    // The living room may be dark while the kitchen is lit, so its vote turns the room on, unless the kitchen is
+    // already at daylight: that is what stopped the 2026-10-23 loop (off at 450 lux, on again at 59%, off, on...).
     def lightsCurrentlyOn = (diningSwitch?.currentSwitch == "on" || kitchenCans?.currentSwitch == "on")
-    boolean indoorNeedsLight = sensorDark(indoorLuxSensor, indoorLuxThreshold ?: 15, lightsCurrentlyOn) ||
-                               sensorDark(indoorLuxSensor2, indoorLuxThreshold2 ?: 40, lightsCurrentlyOn)
+    boolean kitchenDark = sensorDark(indoorLuxSensor2, indoorLuxThreshold2 ?: 40, lightsCurrentlyOn)
+    boolean bookcaseDark = sensorDark(indoorLuxSensor, indoorLuxThreshold ?: 50, lightsCurrentlyOn)
+    boolean indoorNeedsLight = kitchenDark || (bookcaseDark && !kitchenAtDaylight())
     
     // Cloud cover check - if cloudy and not bright enough outside
     // Uses hysteresis: lights ON when outdoor lux drops below cloudyLuxThreshold (400)
@@ -489,18 +499,23 @@ void warnOutdoorSensor(outdoorLux) {
 }
 
 /**
- * One indoor sensor's vote: below its on-threshold with the lights off; below on-threshold + 30 with them on.
- * A sensor that reports a percentage (the Zooz ZSE40) pegs at 100 in any real daylight, so its off-threshold is capped
- * at 100: with an on-threshold of 80 the band would otherwise end at 110, a reading it can never produce, and the
- * sensor would vote "dark" for as long as the lights were on (2026-10-06: lights on at 55% in a 400-lux kitchen).
+ * One indoor sensor's vote. A lux sensor: dark below its on-threshold with the lights off, and still dark below the
+ * bright level with them on (hysteresis wide enough that the pendants cannot talk the room off). A percentage sensor
+ * (the Zooz ZSE40) pegs at 100 and gains ~40 points from the room's own lights, so with the lights on its reading
+ * only counts when it is still below the on-threshold; a high reading with the lights on means nothing.
  */
 boolean sensorDark(dev, Number onThreshold, boolean lightsOn) {
     def lux = dev?.currentIlluminance
     if (lux == null) return false
     BigDecimal on = (onThreshold ?: 0) as BigDecimal
-    BigDecimal off = on + 30
-    if (percentSensor(dev)) off = off.min(100 as BigDecimal)
-    return (lux as BigDecimal) < (lightsOn ? off : on)
+    if (percentSensor(dev) || !lightsOn) return (lux as BigDecimal) < on
+    return (lux as BigDecimal) < ((indoorBrightLux2 ?: 150) as BigDecimal)
+}
+
+/** The kitchen sensor reads daylight (at or above the bright level), whatever the lights are doing. */
+boolean kitchenAtDaylight() {
+    def lux = indoorLuxSensor2?.currentIlluminance
+    return lux != null && (lux as BigDecimal) >= ((indoorBrightLux2 ?: 150) as BigDecimal)
 }
 
 boolean percentSensor(dev) {
@@ -513,12 +528,13 @@ boolean percentSensor(dev) {
 
 /** True when either indoor sensor reads below its turn-on threshold right now (no hysteresis). */
 boolean roomMeasuredDark() {
-    return sensorDark(indoorLuxSensor, indoorLuxThreshold ?: 15, false) || sensorDark(indoorLuxSensor2, indoorLuxThreshold2 ?: 40, false)
+    return sensorDark(indoorLuxSensor2, indoorLuxThreshold2 ?: 40, false) ||
+           (sensorDark(indoorLuxSensor, indoorLuxThreshold ?: 50, false) && !kitchenAtDaylight())
 }
 
 String indoorReadings() {
-    String a = indoorLuxSensor ? "${indoorLuxSensor.displayName} ${indoorLuxSensor.currentIlluminance}/${indoorLuxThreshold ?: 15}" : "no sensor"
-    String b = indoorLuxSensor2 ? ", ${indoorLuxSensor2.displayName} ${indoorLuxSensor2.currentIlluminance}/${indoorLuxThreshold2 ?: 40}" : ""
+    String a = indoorLuxSensor ? "${indoorLuxSensor.displayName} ${indoorLuxSensor.currentIlluminance}/${indoorLuxThreshold ?: 50}" : "no sensor"
+    String b = indoorLuxSensor2 ? ", ${indoorLuxSensor2.displayName} ${indoorLuxSensor2.currentIlluminance}/${indoorLuxThreshold2 ?: 40}-${indoorBrightLux2 ?: 150}" : ""
     return a + b
 }
 
@@ -822,7 +838,7 @@ def luxHandler(evt) {
 def indoorLuxHandler(evt) {
     def lux = (evt.value as BigDecimal).intValue()
     boolean second = indoorLuxSensor2 && ("${evt.deviceId}" == "${indoorLuxSensor2.id}")
-    def threshold = second ? (indoorLuxThreshold2 ?: 40) : (indoorLuxThreshold ?: 15)
+    def threshold = second ? (indoorLuxThreshold2 ?: 40) : (indoorLuxThreshold ?: 50)
     String who = evt.displayName
     
     logDebug "Indoor lux changed: ${who} ${lux} (threshold: ${threshold})"
@@ -844,11 +860,11 @@ def indoorLuxHandler(evt) {
                     if (!state.pendingDarkOn) {
                         state.pendingDarkOn = true
                         state.pendingDarkMins = mins
-                        log.info "${who} ${lux} below ${threshold} in daylight (outdoor ${outdoorLuxSensor?.currentIlluminance} lux) - confirming for ${mins} minutes before turning on"
+                        log.info "Room reads dark (${indoorReadings()}) in daylight (outdoor ${outdoorLuxSensor?.currentIlluminance} lux) - confirming for ${mins} minutes before turning on"
                         runIn(mins * 60, "confirmDarkRoom")
                     }
                 } else {
-                    log.info "${who} ${lux} below ${threshold} - turning on lights"
+                    log.info "Room reads dark (${indoorReadings()}) - turning on lights"
                     safeLogToSheet("indoorLux", lux.toString(), "below threshold, turning on", lux)
                     evaluateLighting("indoor lux changed to ${lux}")
                 }
@@ -1717,12 +1733,17 @@ boolean daytimeDebounceApplies() {
     return lux != null && lux >= (adaptiveLux55 ?: 400)
 }
 
-/** Long debounce under a bright sky (a cloud passing), short once outdoor light is already fading. */
+/**
+ * Long debounce under a bright sky (a cloud passing, a sensor glitch: the kitchen sensor reports every 5 minutes, so one
+ * bad reading lives that long), short only when outdoor light is fading in the last 90 minutes before sunset.
+ */
 Integer darkRoomDebounceMinutes() {
     Integer dayMins = (daytimeOnDebounceMinutes ?: 10) as Integer
     Integer duskMins = (duskDebounceMinutes ?: 3) as Integer
     def lux = outdoorLuxSensor?.currentIlluminance
-    if (lux != null && lux < (duskLuxThreshold ?: 1000)) return Math.max(0, Math.min(dayMins, duskMins))
+    boolean dusk = false
+    try { dusk = now() > location.sunset.time - 90L * 60000L } catch (e) { dusk = false }
+    if (dusk && lux != null && lux < (duskLuxThreshold ?: 1000)) return Math.max(0, Math.min(dayMins, duskMins))
     return dayMins
 }
 
