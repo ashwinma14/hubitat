@@ -6,6 +6,12 @@
  *
  *  Author: Claude (for Ashwin)
  *  Date: 2026-02-12
+ *  Version: 1.45 - a dead Athom no longer keeps the room lit all night (2026-10-23: its link to the hub died at 13:10
+ *                  with motion stuck active, the motion zone it belongs to never went inactive, so the presence timeout
+ *                  never started and the wind-down scene burned until 04:33): the app re-opens the Athom's connection
+ *                  itself when it goes silent (that alone brought it back), starts the presence timeout without the
+ *                  zone when the silent Athom is the only sensor holding it, and takes a live sensor firing as the
+ *                  zone edge it never got, so the room still comes back on
  *  Version: 1.44 - no more on/off loop on a bright, flickering day (2026-10-23): the bookcase sensor's reading only
  *                  counts while the lights are off (the room's own light adds ~40 points to it); the kitchen sensor has
  *                  to read daylight (150 lux) before a lit room may turn off; the bookcase cannot turn the room on while
@@ -67,7 +73,7 @@ preferences {
     page(name: "mainPage")
 }
 
-def appVersion() { return "1.44" }
+def appVersion() { return "1.45" }
 
 def mainPage() {
     dynamicPage(name: "mainPage", title: "Great Room Lighting Controller", install: true, uninstall: true) {
@@ -262,6 +268,7 @@ def initialize() {
     // Living-room PIR: second opinion for the zone dim
     if (lrMotionSensor) {
         subscribe(lrMotionSensor, "motion.active", lrMotionHandler)
+        subscribe(lrMotionSensor, "motion.inactive", lrMotionInactiveHandler)
         if (lrMotionSensor.currentMotion == "active") state.lastLrMotionAt = now()
     }
 
@@ -366,6 +373,7 @@ def initialize() {
     // Watch the Athom for silent failures
     if (livingRoomPresence) {
         state.athomStaleAlerted = false
+        state.athomReconnectTried = false
         runEvery15Minutes(checkSensorHealth)
     }
 
@@ -646,8 +654,11 @@ def windDownStarted() {
 def isAthomStale() {
     // True when the Athom has not sent ANY event recently - its readings can't be trusted.
     // The sensor floods illuminance events when alive, so silence means it's dead/throttled.
+    // A driver that says it is offline (or stuck connecting) is stale too, whatever its last event's age: a reconnect
+    // attempt on an unplugged sensor produces networkStatus events, and those must not read as a recovery.
     if (!livingRoomPresence) return false
     try {
+        if (livingRoomPresence.currentValue("networkStatus") in ["offline", "connecting"]) return true
         def last = livingRoomPresence.getLastActivity()
         if (last == null) return true
         def staleMs = (athomStaleMinutes ?: 30) * 60 * 1000
@@ -660,19 +671,84 @@ def isAthomStale() {
 
 def checkSensorHealth() {
     if (!livingRoomPresence) return
-    def stale = isAthomStale()
-    if (stale && !state.athomStaleAlerted) {
-        state.athomStaleAlerted = true
-        def mins = athomStaleMinutes ?: 30
-        log.warn "Athom presence sensor is stale - no events for over ${mins} minutes. Power cycle it, then click Initialize on the device."
-        notifyAll("Great Room: Athom presence sensor looks dead (no events for ${mins}+ min). Power cycle it, then click Initialize on device 364.")
-        safeLogToSheet("health", "stale", "Athom silent ${mins}+ min", 0)
-    } else if (!stale && state.athomStaleAlerted) {
-        state.athomStaleAlerted = false
-        log.info "Athom presence sensor recovered - events flowing again"
-        notifyAll("Great Room: Athom presence sensor is reporting again.")
-        safeLogToSheet("health", "recovered", "Athom reporting again", 0)
+    boolean stale = isAthomStale()
+    Integer mins = (athomStaleMinutes ?: 30) as Integer
+    if (stale) {
+        // Its stuck "active" must not hold the house hostage while it is silent
+        unstickMotionZone()
+        if (!state.athomStaleAlerted && !state.athomReconnectTried) {
+            // First sign of silence: the ESPHome link dies with the driver still saying "online" (2026-10-23, 13:10 to
+            // 04:45). Re-opening it is enough to bring the sensor back, so try that and look again before raising the alarm.
+            state.athomReconnectTried = true
+            if (reconnectAthom(mins)) { runIn(120, "athomRecheck"); return }
+        }
+        if (!state.athomStaleAlerted) {
+            state.athomStaleAlerted = true
+            log.warn "Athom presence sensor is stale - no events for over ${mins} minutes and re-opening its connection did not help. Power cycle it."
+            notifyAll("Great Room: Athom presence sensor looks dead (no events for ${mins}+ min; re-opening its connection from the hub did not help). Power cycle it.")
+            safeLogToSheet("health", "stale", "Athom silent ${mins}+ min", 0)
+        } else {
+            reconnectAthom(mins, true)   // keeps trying each check; it costs nothing and catches a power cycle the moment it happens
+        }
+    } else {
+        boolean wasAlerted = state.athomStaleAlerted
+        if (state.athomReconnectTried && !wasAlerted) log.info "Athom presence sensor is reporting again after the hub re-opened its connection"
+        state.athomReconnectTried = false
+        if (wasAlerted) {
+            state.athomStaleAlerted = false
+            log.info "Athom presence sensor recovered - events flowing again"
+            notifyAll("Great Room: Athom presence sensor is reporting again.")
+            safeLogToSheet("health", "recovered", "Athom reporting again", 0)
+        }
     }
+}
+
+def athomRecheck() { checkSensorHealth() }
+
+/** Re-open the Athom's ESPHome connection (the driver's initialize). Returns false when the driver cannot. */
+boolean reconnectAthom(Integer mins, boolean quiet = false) {
+    if (!livingRoomPresence?.hasCommand("initialize")) return false
+    String msg = "Athom presence sensor silent for ${mins}+ min (driver says ${livingRoomPresence.currentValue('networkStatus') ?: 'unknown'}) - re-opening its connection"
+    if (quiet) logDebug msg else log.info msg
+    livingRoomPresence.initialize()
+    return true
+}
+
+/**
+ * The motion zone is a Hubitat Motion Zone app that counts the Athom as a plain motion sensor. When the Athom dies
+ * with motion stuck active, the zone never goes inactive, so the presence timeout never starts and the room never
+ * turns off (2026-10-23: the wind-down scene burned from 21:30 to 04:33). While the Athom is silent, the zone's
+ * "active" is trusted only if a live sensor agrees; otherwise the presence timeout runs without the zone, and
+ * presenceTimedOut already ignores a stale Athom.
+ */
+void unstickMotionZone() {
+    if (motionZone?.currentMotion != "active") return
+    if (livingRoomPresence?.currentMotion != "active") return     // the zone is held by something else, it will clear
+    if (!state.presenceActive || state.pendingPresenceOff) return
+    if (anyLiveSensorActive()) return
+    Integer mins = (presenceTimeout ?: 8) as Integer
+    log.info "Motion zone is active, but the only active sensor in it is the silent Athom - starting the ${mins}-minute presence timeout without the zone"
+    safeLogToSheet("timeout", "started", "zone held by stale Athom", 0)
+    state.pendingPresenceOff = true
+    runIn(mins * 60, presenceTimedOut)
+}
+
+/** Any motion sensor the app watches other than the Athom. */
+boolean anyLiveSensorActive() {
+    if (kitchenZoneSensors?.any { it.currentMotion == "active" }) return true
+    if (kitchenPresence?.currentValue("roomState") == "occupied") return true
+    return lrMotionSensor?.currentMotion == "active"
+}
+
+/**
+ * The zone device is stuck active (a dead member holds it) and the app has already timed the house out: a live sensor
+ * firing is the zone edge the app will never get, so it counts as one. Nothing happens while the zone is working.
+ */
+void liveSensorWhileZoneStuck(evt) {
+    if (state.presenceActive) return
+    if (motionZone?.currentMotion != "active") return
+    log.info "${evt.displayName} ${evt.value} while the motion zone is stuck active - counting it as the zone turning active"
+    zoneActive()
 }
 
 def notifyAll(String msg) {
@@ -723,28 +799,7 @@ def motionHandler(evt) {
     safeLogToSheet("motion", evt.value, evt.device.displayName, currentLux)
     
     if (evt.value == "active") {
-        // Cancel any pending presence timeout
-        unschedule(presenceTimedOut)
-        state.pendingPresenceOff = false
-        
-        def wasAlreadyPresent = state.presenceActive
-        state.presenceActive = true
-        
-        if (!wasAlreadyPresent) {
-            logDebug "Presence detected - someone is here"
-        }
-        
-        // Refresh indoor lux sensor on EVERY motion active event (not just first)
-        // This catches gradual darkening while someone is already present
-        if (indoorLuxSensor?.hasCommand("refresh")) {
-            logDebug "Refreshing indoor lux sensor..."
-            indoorLuxSensor.refresh()
-            // Wait 2 seconds for sensor to update, then evaluate
-            runIn(2, evaluateLightingAfterRefresh)
-        } else if (!wasAlreadyPresent) {
-            // Only evaluate on first presence if no indoor sensor
-            evaluateLighting("presence activated")
-        }
+        zoneActive()
     } else {
         // Motion zone went inactive - start timeout
         if (state.presenceActive && !state.pendingPresenceOff) {
@@ -754,6 +809,32 @@ def motionHandler(evt) {
             safeLogToSheet("timeout", "started", "${presenceTimeout} minutes", currentLux)
             runIn(timeoutSeconds, presenceTimedOut)
         }
+    }
+}
+
+/** The motion zone turned active (or a live sensor stood in for it while the zone is stuck). */
+void zoneActive() {
+    // Cancel any pending presence timeout
+    unschedule(presenceTimedOut)
+    state.pendingPresenceOff = false
+
+    def wasAlreadyPresent = state.presenceActive
+    state.presenceActive = true
+
+    if (!wasAlreadyPresent) {
+        logDebug "Presence detected - someone is here"
+    }
+
+    // Refresh indoor lux sensor on EVERY motion active event (not just first)
+    // This catches gradual darkening while someone is already present
+    if (indoorLuxSensor?.hasCommand("refresh")) {
+        logDebug "Refreshing indoor lux sensor..."
+        indoorLuxSensor.refresh()
+        // Wait 2 seconds for sensor to update, then evaluate
+        runIn(2, evaluateLightingAfterRefresh)
+    } else if (!wasAlreadyPresent) {
+        // Only evaluate on first presence if no indoor sensor
+        evaluateLighting("presence activated")
     }
 }
 
@@ -1049,11 +1130,14 @@ def kzActiveHandler(evt) {
     state.kzLastMotionAt = now()
     unschedule("kzDimCheck")
     if (state.kzDimmed) kzRestore("${evt.displayName} ${evt.value}")
+    liveSensorWhileZoneStuck(evt)
 }
 
 def kzInactiveHandler(evt) {
     if (kzActive()) return
     runIn(((kzDimMinutes ?: 5) as Integer) * 60, "kzDimCheck", [overwrite: true])
+    // The zone's own inactive edge never comes while a silent Athom holds it; the kitchen going quiet is the next best cue
+    if (isAthomStale()) unstickMotionZone()
 }
 
 def kzDimCheck() {
@@ -1124,8 +1208,14 @@ long pirVetoRemainingMs() {
     return vetoMs - (now() - ((state.lastLrMotionAt ?: 0L) as Long))
 }
 
+/** The living-room PIR went quiet: with a silent Athom holding the zone, this is the only cue the zone would have had. */
+def lrMotionInactiveHandler(evt) {
+    if (isAthomStale()) unstickMotionZone()
+}
+
 def lrMotionHandler(evt) {
     state.lastLrMotionAt = now()
+    liveSensorWhileZoneStuck(evt)
     // The mmWave said the room was empty but the PIR disagrees: bring the ceiling back, then let the normal dim check run again
     if (state.lrDimmed && lrHueLights?.currentSwitch == "on" && !state.tvTimeActive) {
         log.info "${evt.displayName} saw motion while the LR ceiling was dimmed (mmWave says ${livingRoomPresence?.currentValue('mmwave')}) - brightening"

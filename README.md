@@ -7,7 +7,7 @@ deployed through the hub's MCP Rule Server (`importUrl`), with `deploy.sh` as th
 
 | File | App | Hub instance |
 |------|-----|--------------|
-| GreatRoomLighting.groovy | Great Room Lighting Controller (v1.43) | app:584 (Apps Code id 529) |
+| GreatRoomLighting.groovy | Great Room Lighting Controller (v1.45) | app:584 (Apps Code id 529) |
 | GoveeHolidayScenes.groovy | Govee Holiday Scenes (v1.8) — scene-by-date for the Govee string lights, deck lights and pathway bulbs | app:590 (Apps Code id 590) |
 | GreatRoomLightingLogger.gs | Google Apps Script webhook for Sheets logging | (Google) |
 | tools/LuxCsvRepair.groovy | One-off utility: rebuilt `lux_clean.csv` on 2026-09-30 (used once, then removed from the hub) | none |
@@ -56,6 +56,26 @@ or after 6 h. A press put back where the automation had it counts for nothing; t
 in 30 s is a child and the scene is restored after 20 s; a brighter press during the morning
 ramp is a floor the ramp continues from. The kitchen cans switch (Zooz ZEN71, Advanced
 driver) shows red while under manual control.
+
+## Great Room: how the two indoor sensors vote (v1.44)
+
+The bookcase ZSE40 (289) reports a capped percentage that the room's own lights push up by
+~40 points, so it only counts while the lights are off (turn on below 50) and can never say
+"bright". The kitchen Hue sensor (41) reads real lux: turn on below 40, and a lit room may only
+turn off once it reads the daylight level (150). The bookcase cannot turn the room on while the
+kitchen is at daylight. Daytime dark-room debounce is 10 min, 3 min only in the last 90 min
+before sunset.
+
+## Great Room: the Athom and the motion zone (v1.45)
+
+The Athom mmWave (364, ESPHome) is a member of the hub's Motion Zone app
+(DownstairsALLMotionDetection → device 404), which the app uses as its presence signal. Its
+link to the hub can die with the driver still saying "online" (2026-10-23, 13:10 → 04:45:
+motion stuck active, zone never inactive, room lit all night). The app now treats the Athom as
+stale after 30 silent minutes or whenever the driver says offline, re-opens the connection
+itself (`initialize`, which was all it took), alerts only if that fails, starts the presence
+timeout without the zone when the silent Athom is the only sensor holding it, and takes a live
+sensor firing as the zone edge so the room still comes back on.
 
 ## Govee Holiday Scenes (app 590)
 
