@@ -84,8 +84,10 @@ on for the full 90-minute backstop). A blip restarts the 20 minutes.
 
 ## Govee Holiday Scenes (app 590)
 
-Lights: string lights 433 and deck lights 434 (powered by the Twinkle/Front Lights plugs),
-pathway bulbs 436 and 437 (Govee H600A on a non-smart sunset timer: no plug event, so they
+Lights: string lights 433 (H7021, 96 ft, 30 bulbs), deck lights 434 (H7067, 15), Front String
+Lights 441 (H702C, 144 ft, 45 bulbs, added 2026-10-26), all powered by the Twinkle/Front Lights
+plugs; the per-light bulb count must match the Govee API's segment range (the alternate pattern
+paints segments 0..count-1), and pathway bulbs 436 and 437 (Govee H600A on a non-smart sunset timer: no plug event, so they
 are marked "self-powered": nothing is sent before the hub's sunset, a burst goes out at
 sunset +1/+3/+6 min, and they are re-sent every 5 min while the plugs are on until the
 driver reports `cloudAPI=Success`). A two-color spec such as `alt:#8B00FF/#FF5500` alternates bulbs on the
