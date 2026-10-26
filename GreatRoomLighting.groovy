@@ -6,6 +6,10 @@
  *
  *  Author: Claude (for Ashwin)
  *  Date: 2026-02-12
+ *  Version: 1.46 - the mmWave gets a vote against the dead-end hold: once it has read empty for 20 minutes with no
+ *                  living-room motion, the hold drops and the normal timeout ends the room (2026-10-25: the house left
+ *                  at 08:39 by a door no sensor covers and the inference kept the lights until the 90-minute backstop
+ *                  at 10:12 while the mmWave said empty throughout); a blip restarts the 20 minutes
  *  Version: 1.45 - a dead Athom no longer keeps the room lit all night (2026-10-23: its link to the hub died at 13:10
  *                  with motion stuck active, the motion zone it belongs to never went inactive, so the presence timeout
  *                  never started and the wind-down scene burned until 04:33): the app re-opens the Athom's connection
@@ -73,7 +77,7 @@ preferences {
     page(name: "mainPage")
 }
 
-def appVersion() { return "1.45" }
+def appVersion() { return "1.46" }
 
 def mainPage() {
     dynamicPage(name: "mainPage", title: "Great Room Lighting Controller", install: true, uninstall: true) {
@@ -120,8 +124,9 @@ def mainPage() {
         }
 
         section("<b>Zones</b>") {
-            paragraph "The living room is a dead end: once it has seen someone, it stays occupied until a sensor outside it fires after the living room last did. Sitting still never times the house out; walking out through the kitchen does. The kitchen/dining/hallway zone dims after a few quiet minutes while the room is on and comes straight back on motion."
+            paragraph "The living room is a dead end: once it has seen someone, it stays occupied until a sensor outside it fires after the living room last did. Sitting still never times the house out; walking out through the kitchen does, and so does the mmWave reading empty for a while with the PIR quiet. The kitchen/dining/hallway zone dims after a few quiet minutes while the room is on and comes straight back on motion."
             input "lrBackstopMinutes", "number", title: "Living room: give up the dead-end inference after this many minutes with no activity anywhere", defaultValue: 45, required: true, width: 6
+            input "lrMmwaveEmptyMinutes", "number", title: "...or sooner, once the mmWave has read empty this many minutes with no living-room motion (0 = never)", defaultValue: 20, required: true, width: 6
             input "lrExitGraceSeconds", "number", title: "Kitchen-zone activity within this many seconds after living-room activity counts as the same movement", defaultValue: 20, required: true, width: 6
             input "lrMmwaveAnchorSeconds", "number", title: "The living-room mmWave must stay active this many seconds before it counts as living-room motion (its shorter blips are noise; the PIR counts at once)", defaultValue: 45, required: true, width: 6
             input "kzDimMinutes", "number", title: "Kitchen zone dims after this many quiet minutes", defaultValue: 5, required: true, width: 4
@@ -874,7 +879,9 @@ def presenceTimedOut() {
     // Dead-end inference: the living room last saw someone and nothing outside it has moved since, so they are still there
     if (lrSticky()) {
         long quietMin = (now() - ((state.lastLrMotionAt ?: 0L) as Long)) / 60000L
-        log.info "Presence timeout, but the living room is a dead end and nothing outside it has moved since it was last occupied (${quietMin} min ago) - keeping the lights (backstop ${lrBackstopMinutes ?: 45} min)"
+        long mmEmpty = mmwaveEmptyMinutes()
+        String mmText = mmEmpty < 0 ? "mmWave not reading empty" : "mmWave empty ${mmEmpty} min of ${lrMmwaveEmptyMinutes ?: 20}"
+        log.info "Presence timeout, but the living room is a dead end and nothing outside it has moved since it was last occupied (${quietMin} min ago) - keeping the lights (${mmText}; backstop ${lrBackstopMinutes ?: 45} min)"
         safeLogToSheet("timeout", "extended", "Living room dead-end inference", currentLux)
         state.pendingPresenceOff = false
         runIn(300, presenceTimedOut)
@@ -882,7 +889,10 @@ def presenceTimedOut() {
     }
     
     safeLogToSheet("timeout", "completed", "Presence cleared", currentLux)
-    
+
+    long mmEmpty = mmwaveEmptyMinutes()
+    long lrQuiet = state.lastLrMotionAt ? (now() - (state.lastLrMotionAt as Long)) / 60000L : -1L
+    log.info "Presence timeout - nobody detected (mmWave ${mmEmpty < 0 ? 'not reading empty' : 'empty ' + mmEmpty + ' min'}, living room quiet ${lrQuiet} min) - turning off"
     state.presenceActive = false
     state.pendingPresenceOff = false
     clearOverrides("everyone left")
@@ -1115,8 +1125,33 @@ boolean lrSticky() {
     long lr = (state.lastLrMotionAt ?: 0L) as Long
     if (lr == 0L) return false
     if (now() - lr > ((lrBackstopMinutes ?: 45) as Long) * 60000L) return false
+    if (mmwaveSaysEmpty(lr)) return false
     long kz = (state.kzLastMotionAt ?: 0L) as Long
     return lr + ((lrExitGraceSeconds ?: 20) as Long) * 1000L >= kz
+}
+
+/**
+ * The mmWave gets a vote against the dead-end hold: alive, reading empty for lrMmwaveEmptyMinutes, and no living-room
+ * motion of any kind in that time (PIR or anchored mmWave) means the room is empty. 2026-10-25: the house left at 08:39
+ * by a door no sensor covers and the hold kept the lights until 10:12 while the mmWave said empty throughout.
+ * A blip restarts the clock, so this only ever shortens a hold on a room the mmWave has not seen anyone in.
+ */
+boolean mmwaveSaysEmpty(long lastLrMotion) {
+    if (!livingRoomPresence || isAthomStale()) return false
+    Integer mins = (lrMmwaveEmptyMinutes ?: 20) as Integer
+    if (mins <= 0) return false
+    def st = livingRoomPresence.currentState("mmwave")
+    if (st?.value != "inactive" || st.date == null) return false
+    long quietMs = mins * 60000L
+    if (lrMotionSensor?.currentMotion == "active") return false
+    return (now() - st.date.time) >= quietMs && (now() - lastLrMotion) >= quietMs
+}
+
+/** How long the mmWave has read empty, in whole minutes, for log lines (-1 when it is not reading empty). */
+long mmwaveEmptyMinutes() {
+    def st = livingRoomPresence?.currentState("mmwave")
+    if (st?.value != "inactive" || st.date == null) return -1L
+    return (now() - st.date.time) / 60000L
 }
 
 // ==================== KITCHEN ZONE (everything outside the living room) ====================
