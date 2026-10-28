@@ -6,6 +6,10 @@
  *
  *  Author: Claude (for Ashwin)
  *  Date: 2026-02-12
+ *  Version: 1.47 - predawn ends at the EARLIER of the clock time and sunrise-20 (it was the later: on 2026-10-28, sunrise
+ *                  07:47, the gentle predawn levels ran until 07:27 and the ramp until 07:57 while the house was up and
+ *                  cooking); the stuck-zone fallback ignores a zone that turned active in the last 90 s (its handler is
+ *                  just behind the sensor's; the scene was being applied twice)
  *  Version: 1.46 - the mmWave gets a vote against the dead-end hold: once it has read empty for 20 minutes with no
  *                  living-room motion, the hold drops and the normal timeout ends the room (2026-10-25: the house left
  *                  at 08:39 by a door no sensor covers and the inference kept the lights until the 90-minute backstop
@@ -77,7 +81,7 @@ preferences {
     page(name: "mainPage")
 }
 
-def appVersion() { return "1.46" }
+def appVersion() { return "1.47" }
 
 def mainPage() {
     dynamicPage(name: "mainPage", title: "Great Room Lighting Controller", install: true, uninstall: true) {
@@ -189,7 +193,7 @@ def mainPage() {
             input "turnOnFadeSeconds", "number", title: "Fade-in when the room turns on (seconds)", defaultValue: 60, required: true, width: 4
             input "ambientFadeSeconds", "number", title: "Fade for ambient steps (seconds)", defaultValue: 45, required: true, width: 4
             input "sceneFadeSeconds", "number", title: "Fade for scene changes (seconds)", defaultValue: 3, required: true, width: 4
-            input "predawnSunriseOffset", "number", title: "Predawn lasts until this many minutes before sunrise (or the predawn end time above, whichever is later)", defaultValue: 20, required: true, width: 6
+            input "predawnSunriseOffset", "number", title: "Predawn ends this many minutes before sunrise when that comes earlier than the predawn end time above (it never runs later than that time)", defaultValue: 20, required: true, width: 6
             input "morningRampMinutes", "number", title: "Minutes to ramp from predawn levels to full once predawn ends", defaultValue: 30, required: true, width: 6
             input "daytimeOnDebounceMinutes", "number", title: "Daytime with bright outdoors: the dark-room condition must hold this many minutes before the lights turn on", defaultValue: 10, required: true, width: 4
             input "duskLuxThreshold", "number", title: "...but once outdoor lux is below this, use the shorter dusk debounce", defaultValue: 1000, required: true, width: 4
@@ -350,7 +354,7 @@ def initialize() {
     // Schedule 3am TV Time auto-reset
     schedule("0 0 3 * * ?", resetTvTime)
 
-    // Predawn ends at the later of the configured time and (sunrise - offset); re-armed just after midnight
+    // Predawn ends at the earlier of the configured time and (sunrise - offset); re-armed just after midnight
     schedule("0 1 0 * * ?", armPredawnEnd)
     armPredawnEnd()
 
@@ -575,7 +579,7 @@ boolean isMorning() {
 }
 
 def isPredawn() {
-    // True before today's predawn end (configured time, or sunrise minus the offset when adaptive brightness is on), hub-local time
+    // True before today's predawn end (the configured time, or sunrise minus the offset if that is earlier), hub-local time
     def cal = java.util.Calendar.getInstance(location.timeZone)
     def nowMins = cal.get(java.util.Calendar.HOUR_OF_DAY) * 60 + cal.get(java.util.Calendar.MINUTE)
     return nowMins < predawnEndMinutes()
@@ -589,7 +593,9 @@ Integer predawnEndMinutes() {
         def cal = java.util.Calendar.getInstance(location.timeZone)
         cal.setTime(location.sunrise)
         Integer sunriseMins = cal.get(java.util.Calendar.HOUR_OF_DAY) * 60 + cal.get(java.util.Calendar.MINUTE)
-        return Math.max(configured, sunriseMins - ((predawnSunriseOffset ?: 20) as Integer))
+        // The earlier of the two: a late-autumn sunrise (07:47 on 2026-10-28) used to keep the gentle predawn levels going
+        // until 07:27 and the ramp until 07:57, long after the house was up and cooking. The clock time is the ceiling.
+        return Math.min(configured, sunriseMins - ((predawnSunriseOffset ?: 20) as Integer))
     } catch (e) {
         logDebug "Sunrise lookup failed (${e.message}); using configured predawn end"
         return configured
@@ -751,7 +757,12 @@ boolean anyLiveSensorActive() {
  */
 void liveSensorWhileZoneStuck(evt) {
     if (state.presenceActive) return
-    if (motionZone?.currentMotion != "active") return
+    def zs = motionZone?.currentState("motion")
+    if (zs?.value != "active") return
+    // The zone's own event is dispatched alongside the sensor's, so a zone that turned active moments ago is not stuck:
+    // its handler is simply still on its way (2026-10-28: the scene was applied twice at 05:41 and 06:47). A zone that has
+    // been active for minutes while the app thinks the house is empty is the real thing.
+    if (zs.date == null || now() - zs.date.time < 90000L) return
     log.info "${evt.displayName} ${evt.value} while the motion zone is stuck active - counting it as the zone turning active"
     zoneActive()
 }
