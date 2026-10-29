@@ -6,6 +6,9 @@
  *
  *  Author: Claude (for Ashwin)
  *  Date: 2026-02-12
+ *  Version: 1.49 - exits end the living-room hold: motion on the stairs or the front door opening after the living
+ *                  room last moved means that person left, no grace (the 20 s "same movement" grace swallowed a walk to
+ *                  the stairs, 2026-10-29 06:48); the mmWave anchor is dated when the mmWave went active, not 45 s later
  *  Version: 1.48 - zone watchdog: when every sensor in the motion zone has been quiet for 7 minutes and the zone device
  *                  still says active, the presence timeout runs without it (2026-10-29: all six sensors quiet from 05:50,
  *                  the Motion Zone app never timed out, the room stayed lit until 06:47 with the Athom alive; v1.45 only
@@ -85,7 +88,7 @@ preferences {
     page(name: "mainPage")
 }
 
-def appVersion() { return "1.48" }
+def appVersion() { return "1.49" }
 
 def mainPage() {
     dynamicPage(name: "mainPage", title: "Great Room Lighting Controller", install: true, uninstall: true) {
@@ -96,6 +99,8 @@ def mainPage() {
             input "lrMotionSensor", "capability.motionSensor", title: "Living room motion sensor (PIR second opinion: the ceiling never dims while it has seen motion recently, and its motion re-brightens a dimmed ceiling)", required: false
             input "kitchenZoneSensors", "capability.motionSensor", title: "Kitchen/dining/hallway motion sensors (everything outside the living room; the kitchen presence sensor above counts too)", multiple: true, required: false
             input "kitchenPresence", "capability.motionSensor", title: "Kitchen Presence Sensor (FP1E - for true presence)", required: false
+            input "exitSensors", "capability.motionSensor", title: "Exit sensors (the stairs): motion here after the living room last moved means somebody left it, with no grace period", required: false, multiple: true
+            input "exitDoors", "capability.contactSensor", title: "Exit doors (the front door): opening after the living room last moved means somebody left it", required: false, multiple: true
             input "indoorLuxSensor", "capability.illuminanceMeasurement", title: "Indoor Lux Sensor (for dark room detection)", required: false
             input "indoorLuxSensor2", "capability.illuminanceMeasurement", title: "Second indoor lux sensor (true-lux sensor such as the kitchen Hue motion sensor; the room counts as dark when EITHER sensor says so)", required: false
             input "outdoorLuxSensor", "capability.illuminanceMeasurement", title: "Outdoor Lux Sensor (for cloudy day check)", required: false
@@ -298,6 +303,10 @@ def initialize() {
         subscribe(kitchenPresence, "roomState.occupied", kzActiveHandler)
         subscribe(kitchenPresence, "roomState.unoccupied", kzInactiveHandler)
     }
+    // Exits: the stairs and the front door end the living-room hold outright (2026-10-29: a walk up the stairs 6 s after
+    // the last living-room motion fell inside the 20 s "same movement" grace and the hold ran on)
+    if (exitSensors) subscribe(exitSensors, "motion.active", exitHandler)
+    if (exitDoors) subscribe(exitDoors, "contact.open", exitHandler)
     state.kzDimmed = false
     if (kzActive()) state.kzLastMotionAt = now()
     else if (kitchenZoneSensors) runIn(((kzDimMinutes ?: 5) as Integer) * 60, "kzDimCheck")
@@ -1123,10 +1132,19 @@ def livingRoomPresenceHandler(evt) {
 
 /** The mmWave has stayed active for lrMmwaveAnchorSeconds: that is real presence, not a blip. */
 def lrMmwaveAnchor() {
-    if (livingRoomPresence?.currentValue("mmwave") == "active") {
-        state.lastLrMotionAt = now()
+    def st = livingRoomPresence?.currentState("mmwave")
+    if (st?.value == "active") {
+        // Dated when the mmWave went active, not when this anchor fired: the 45 s wait used to post-date the living room's
+        // last motion past an exit seen in between (stairs at 06:47:53, anchor at 06:48:02 on 2026-10-29)
+        state.lastLrMotionAt = st.date ? st.date.time : now()
         logDebug "mmWave active for ${lrMmwaveAnchorSeconds ?: 45}s - counts as living-room motion"
     }
+}
+
+/** Somebody went up the stairs or out the front door: whatever the living room last saw, that person left it. */
+def exitHandler(evt) {
+    state.exitAt = now()
+    logDebug "Exit seen: ${evt.displayName} ${evt.value}"
 }
 
 /** Living room occupied: the mmWave says active, the PIR saw motion within lrDimVetoMinutes, or the dead-end inference holds. */
@@ -1146,6 +1164,7 @@ boolean lrSticky() {
     if (lr == 0L) return false
     if (now() - lr > ((lrBackstopMinutes ?: 45) as Long) * 60000L) return false
     if (mmwaveSaysEmpty(lr)) return false
+    if (((state.exitAt ?: 0L) as Long) > lr) return false     // the stairs or the front door saw them leave
     long kz = (state.kzLastMotionAt ?: 0L) as Long
     return lr + ((lrExitGraceSeconds ?: 20) as Long) * 1000L >= kz
 }
