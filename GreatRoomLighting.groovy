@@ -6,6 +6,10 @@
  *
  *  Author: Claude (for Ashwin)
  *  Date: 2026-02-12
+ *  Version: 1.48 - zone watchdog: when every sensor in the motion zone has been quiet for 7 minutes and the zone device
+ *                  still says active, the presence timeout runs without it (2026-10-29: all six sensors quiet from 05:50,
+ *                  the Motion Zone app never timed out, the room stayed lit until 06:47 with the Athom alive; v1.45 only
+ *                  covered a silent Athom); the watchdog is fed by every member's inactive event and cancelled by any active one
  *  Version: 1.47 - predawn ends at the EARLIER of the clock time and sunrise-20 (it was the later: on 2026-10-28, sunrise
  *                  07:47, the gentle predawn levels ran until 07:27 and the ramp until 07:57 while the house was up and
  *                  cooking); the stuck-zone fallback ignores a zone that turned active in the last 90 s (its handler is
@@ -81,7 +85,7 @@ preferences {
     page(name: "mainPage")
 }
 
-def appVersion() { return "1.47" }
+def appVersion() { return "1.48" }
 
 def mainPage() {
     dynamicPage(name: "mainPage", title: "Great Room Lighting Controller", install: true, uninstall: true) {
@@ -131,6 +135,7 @@ def mainPage() {
             paragraph "The living room is a dead end: once it has seen someone, it stays occupied until a sensor outside it fires after the living room last did. Sitting still never times the house out; walking out through the kitchen does, and so does the mmWave reading empty for a while with the PIR quiet. The kitchen/dining/hallway zone dims after a few quiet minutes while the room is on and comes straight back on motion."
             input "lrBackstopMinutes", "number", title: "Living room: give up the dead-end inference after this many minutes with no activity anywhere", defaultValue: 45, required: true, width: 6
             input "lrMmwaveEmptyMinutes", "number", title: "...or sooner, once the mmWave has read empty this many minutes with no living-room motion (0 = never)", defaultValue: 20, required: true, width: 6
+            input "zoneWatchdogMinutes", "number", title: "Zone watchdog: if every sensor in the motion zone has been quiet this many minutes and the zone still says active, start the presence timeout without it (the zone's own timeout is 5 min)", defaultValue: 7, required: true, width: 6
             input "lrExitGraceSeconds", "number", title: "Kitchen-zone activity within this many seconds after living-room activity counts as the same movement", defaultValue: 20, required: true, width: 6
             input "lrMmwaveAnchorSeconds", "number", title: "The living-room mmWave must stay active this many seconds before it counts as living-room motion (its shorter blips are noise; the PIR counts at once)", defaultValue: 45, required: true, width: 6
             input "kzDimMinutes", "number", title: "Kitchen zone dims after this many quiet minutes", defaultValue: 5, required: true, width: 4
@@ -272,6 +277,9 @@ def initialize() {
         subscribe(livingRoomPresence, "mmwave", livingRoomPresenceHandler)
         // Also subscribe to mmwave for true presence detection
         subscribe(livingRoomPresence, "mmwave", truePresenceHandler)
+        // Its motion attribute (mmWave or PIR) is what the zone app watches: feed the zone watchdog from it too
+        subscribe(livingRoomPresence, "motion.active", zoneMemberActiveHandler)
+        subscribe(livingRoomPresence, "motion.inactive", zoneMemberQuietHandler)
     }
     
     // Living-room PIR: second opinion for the zone dim
@@ -832,6 +840,7 @@ def motionHandler(evt) {
 void zoneActive() {
     // Cancel any pending presence timeout
     unschedule(presenceTimedOut)
+    unschedule("zoneWatchdog")
     state.pendingPresenceOff = false
 
     def wasAlreadyPresent = state.presenceActive
@@ -1175,6 +1184,7 @@ boolean kzActive() {
 def kzActiveHandler(evt) {
     state.kzLastMotionAt = now()
     unschedule("kzDimCheck")
+    unschedule("zoneWatchdog")
     if (state.kzDimmed) kzRestore("${evt.displayName} ${evt.value}")
     liveSensorWhileZoneStuck(evt)
 }
@@ -1184,6 +1194,42 @@ def kzInactiveHandler(evt) {
     runIn(((kzDimMinutes ?: 5) as Integer) * 60, "kzDimCheck", [overwrite: true])
     // The zone's own inactive edge never comes while a silent Athom holds it; the kitchen going quiet is the next best cue
     if (isAthomStale()) unstickMotionZone()
+    zoneMemberQuietHandler(evt)
+}
+
+/** A zone member reported motion: the zone is not quiet, so the watchdog stands down. */
+def zoneMemberActiveHandler(evt) {
+    unschedule("zoneWatchdog")
+    liveSensorWhileZoneStuck(evt)
+}
+
+/**
+ * A zone member went quiet. If every member is quiet, the zone device should follow within its own activity timeout
+ * (5 min); the watchdog gives it that plus a grace period and then stops waiting for it. 2026-10-29: every sensor was
+ * quiet from 05:50 to 06:47 and the Motion Zone app never went inactive, so the room stayed lit for an hour with the
+ * Athom alive and well (the v1.45 fallback only covered a silent Athom).
+ */
+def zoneMemberQuietHandler(evt) {
+    if (anyZoneMemberActive()) return
+    if (!state.presenceActive || state.pendingPresenceOff) return
+    runIn(Math.max(60, ((zoneWatchdogMinutes ?: 7) as Integer) * 60), "zoneWatchdog", [overwrite: true])
+}
+
+def zoneWatchdog() {
+    if (motionZone?.currentMotion != "active") return
+    if (anyZoneMemberActive()) return
+    if (!state.presenceActive || state.pendingPresenceOff) return
+    Integer mins = (presenceTimeout ?: 8) as Integer
+    log.warn "Motion zone still active ${zoneWatchdogMinutes ?: 7} min after every sensor in it went quiet - starting the ${mins}-minute presence timeout without it"
+    safeLogToSheet("timeout", "started", "zone watchdog", 0)
+    state.pendingPresenceOff = true
+    runIn(mins * 60, presenceTimedOut)
+}
+
+/** Any zone member reporting motion, counting the Athom only while it is alive. */
+boolean anyZoneMemberActive() {
+    if (anyLiveSensorActive()) return true
+    return livingRoomPresence && !isAthomStale() && livingRoomPresence.currentMotion == "active"
 }
 
 def kzDimCheck() {
@@ -1257,10 +1303,12 @@ long pirVetoRemainingMs() {
 /** The living-room PIR went quiet: with a silent Athom holding the zone, this is the only cue the zone would have had. */
 def lrMotionInactiveHandler(evt) {
     if (isAthomStale()) unstickMotionZone()
+    zoneMemberQuietHandler(evt)
 }
 
 def lrMotionHandler(evt) {
     state.lastLrMotionAt = now()
+    unschedule("zoneWatchdog")
     liveSensorWhileZoneStuck(evt)
     // The mmWave said the room was empty but the PIR disagrees: bring the ceiling back, then let the normal dim check run again
     if (state.lrDimmed && lrHueLights?.currentSwitch == "on" && !state.tvTimeActive) {

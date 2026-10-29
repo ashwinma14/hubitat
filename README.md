@@ -7,7 +7,7 @@ deployed through the hub's MCP Rule Server (`importUrl`), with `deploy.sh` as th
 
 | File | App | Hub instance |
 |------|-----|--------------|
-| GreatRoomLighting.groovy | Great Room Lighting Controller (v1.47) | app:584 (Apps Code id 529) |
+| GreatRoomLighting.groovy | Great Room Lighting Controller (v1.48) | app:584 (Apps Code id 529) |
 | GoveeHolidayScenes.groovy | Govee Holiday Scenes (v1.8) — scene-by-date for the Govee string lights, deck lights and pathway bulbs | app:590 (Apps Code id 590) |
 | GreatRoomLightingLogger.gs | Google Apps Script webhook for Sheets logging | (Google) |
 | tools/LuxCsvRepair.groovy | One-off utility: rebuilt `lux_clean.csv` on 2026-09-30 (used once, then removed from the hub) | none |
@@ -76,6 +76,11 @@ stale after 30 silent minutes or whenever the driver says offline, re-opens the 
 itself (`initialize`, which was all it took), alerts only if that fails, starts the presence
 timeout without the zone when the silent Athom is the only sensor holding it, and takes a live
 sensor firing as the zone edge so the room still comes back on.
+
+Since v1.48 a zone watchdog covers any zone failure, not just a dead Athom: when every member
+sensor has been quiet for `zoneWatchdogMinutes` (7; the zone's own timeout is 5) and the zone
+device still says active, the presence timeout runs without it (2026-10-29: all sensors quiet
+from 05:50, the Motion Zone app never timed out, room lit until 06:47).
 
 Since v1.46 the mmWave also votes against the living-room dead-end hold: alive, reading empty
 for `lrMmwaveEmptyMinutes` (20) with no living-room motion in that time, and the hold drops so
