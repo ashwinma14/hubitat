@@ -6,6 +6,10 @@
  *
  *  Author: Claude (for Ashwin)
  *  Date: 2026-02-12
+ *  Version: 1.50 - the daylight bar is 100 lux, not 150, and the bookcase's kitchen ceiling is its own setting (60): the
+ *                  living-room sensor may only turn the room on while the kitchen reads under 60 with the lights off, so
+ *                  a room that turned off at 100 (about 70 without the lights) cannot be turned straight back on by the
+ *                  bookcase (2026-11-01: a dull overcast day, 109 lux with the lights on, lit all day under the 150 bar)
  *  Version: 1.49 - exits end the living-room hold: motion on the stairs or the front door opening after the living
  *                  room last moved means that person left, no grace (the 20 s "same movement" grace swallowed a walk to
  *                  the stairs, 2026-10-29 06:48); the mmWave anchor is dated when the mmWave went active, not 45 s later
@@ -88,7 +92,7 @@ preferences {
     page(name: "mainPage")
 }
 
-def appVersion() { return "1.49" }
+def appVersion() { return "1.50" }
 
 def mainPage() {
     dynamicPage(name: "mainPage", title: "Great Room Lighting Controller", install: true, uninstall: true) {
@@ -121,7 +125,8 @@ def mainPage() {
             paragraph "Configure your Mode Manager to change modes based on outdoor lux sensor thresholds."
             input "indoorLuxThreshold", "number", title: "Living-room sensor (percentage): turn on when below this with the lights off; with them on it only ever says dark, never bright", defaultValue: 50, required: true, width: 4
             input "indoorLuxThreshold2", "number", title: "Kitchen sensor (lux): turn on when below", defaultValue: 40, required: true, width: 4
-            input "indoorBrightLux2", "number", title: "Kitchen sensor (lux): daylight level - the room may turn off once it reads this with the lights on, and the living-room sensor cannot turn it on above this", defaultValue: 150, required: true, width: 4
+            input "indoorBrightLux2", "number", title: "Kitchen sensor (lux): daylight level - the room may turn off once it reads this with the lights on (the lights themselves add about 30 lux at this sensor)", defaultValue: 100, required: true, width: 4
+            input "bookcaseKitchenCeiling", "number", title: "Kitchen sensor (lux): the living-room sensor may turn the room on only while the kitchen reads below this with the lights off. Keep it at least 30 under the daylight level, or the room loops on and off (2026-10-23)", defaultValue: 60, required: true, width: 4
             input "cloudyThreshold", "number", title: "Cloud cover % threshold (turn on if above)", defaultValue: 70, required: true
             input "cloudyLuxThreshold", "number", title: "Outdoor lux threshold for cloudy check", defaultValue: 400, required: true
             input "presenceTimeout", "number", title: "Minutes before presence times out", defaultValue: 8, required: true
@@ -469,12 +474,15 @@ def isLightNeeded() {
     // it has to read real daylight (the bright level) before the room may turn off, so the pendants' own light cannot
     // end the night. The bookcase ZSE40 reads a capped percentage that the living-room lights push up by ~40 points,
     // so with the lights on it only counts when it still reads dark; it never gets to say "bright".
-    // The living room may be dark while the kitchen is lit, so its vote turns the room on, unless the kitchen is
-    // already at daylight: that is what stopped the 2026-10-23 loop (off at 450 lux, on again at 59%, off, on...).
+    // The living room may be dark while the kitchen is lit, so its vote turns the room on, unless the kitchen already
+    // reads above its own ceiling: that is what stopped the 2026-10-23 loop (off at 450 lux, on again at 59%, off, on...).
+    // The ceiling sits under the daylight level by more than the lights add at the kitchen sensor, so a room that just
+    // turned off for daylight cannot be turned straight back on by the bookcase (2026-11-01: 109 lux with the lights on,
+    // ~79 without, dull but lit; the old 150 bar kept the room on all day).
     def lightsCurrentlyOn = (diningSwitch?.currentSwitch == "on" || kitchenCans?.currentSwitch == "on")
     boolean kitchenDark = sensorDark(indoorLuxSensor2, indoorLuxThreshold2 ?: 40, lightsCurrentlyOn)
     boolean bookcaseDark = sensorDark(indoorLuxSensor, indoorLuxThreshold ?: 50, lightsCurrentlyOn)
-    boolean indoorNeedsLight = kitchenDark || (bookcaseDark && !kitchenAtDaylight())
+    boolean indoorNeedsLight = kitchenDark || (bookcaseDark && !kitchenAboveCeiling())
     
     // Cloud cover check - if cloudy and not bright enough outside
     // Uses hysteresis: lights ON when outdoor lux drops below cloudyLuxThreshold (400)
@@ -543,13 +551,13 @@ boolean sensorDark(dev, Number onThreshold, boolean lightsOn) {
     if (lux == null) return false
     BigDecimal on = (onThreshold ?: 0) as BigDecimal
     if (percentSensor(dev) || !lightsOn) return (lux as BigDecimal) < on
-    return (lux as BigDecimal) < ((indoorBrightLux2 ?: 150) as BigDecimal)
+    return (lux as BigDecimal) < ((indoorBrightLux2 ?: 100) as BigDecimal)
 }
 
-/** The kitchen sensor reads daylight (at or above the bright level), whatever the lights are doing. */
-boolean kitchenAtDaylight() {
+/** The kitchen sensor reads above the bookcase ceiling: the living-room sensor alone may not turn the room on. */
+boolean kitchenAboveCeiling() {
     def lux = indoorLuxSensor2?.currentIlluminance
-    return lux != null && (lux as BigDecimal) >= ((indoorBrightLux2 ?: 150) as BigDecimal)
+    return lux != null && (lux as BigDecimal) >= ((bookcaseKitchenCeiling ?: 60) as BigDecimal)
 }
 
 boolean percentSensor(dev) {
@@ -563,12 +571,12 @@ boolean percentSensor(dev) {
 /** True when either indoor sensor reads below its turn-on threshold right now (no hysteresis). */
 boolean roomMeasuredDark() {
     return sensorDark(indoorLuxSensor2, indoorLuxThreshold2 ?: 40, false) ||
-           (sensorDark(indoorLuxSensor, indoorLuxThreshold ?: 50, false) && !kitchenAtDaylight())
+           (sensorDark(indoorLuxSensor, indoorLuxThreshold ?: 50, false) && !kitchenAboveCeiling())
 }
 
 String indoorReadings() {
     String a = indoorLuxSensor ? "${indoorLuxSensor.displayName} ${indoorLuxSensor.currentIlluminance}/${indoorLuxThreshold ?: 50}" : "no sensor"
-    String b = indoorLuxSensor2 ? ", ${indoorLuxSensor2.displayName} ${indoorLuxSensor2.currentIlluminance}/${indoorLuxThreshold2 ?: 40}-${indoorBrightLux2 ?: 150}" : ""
+    String b = indoorLuxSensor2 ? ", ${indoorLuxSensor2.displayName} ${indoorLuxSensor2.currentIlluminance}/${indoorLuxThreshold2 ?: 40}-${indoorBrightLux2 ?: 100} (bookcase ceiling ${bookcaseKitchenCeiling ?: 60})" : ""
     return a + b
 }
 

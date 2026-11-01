@@ -7,7 +7,7 @@ deployed through the hub's MCP Rule Server (`importUrl`), with `deploy.sh` as th
 
 | File | App | Hub instance |
 |------|-----|--------------|
-| GreatRoomLighting.groovy | Great Room Lighting Controller (v1.49) | app:584 (Apps Code id 529) |
+| GreatRoomLighting.groovy | Great Room Lighting Controller (v1.50) | app:584 (Apps Code id 529) |
 | GoveeHolidayScenes.groovy | Govee Holiday Scenes (v1.8) — scene-by-date for the Govee string lights, deck lights and pathway bulbs | app:590 (Apps Code id 590) |
 | GreatRoomLightingLogger.gs | Google Apps Script webhook for Sheets logging | (Google) |
 | tools/LuxCsvRepair.groovy | One-off utility: rebuilt `lux_clean.csv` on 2026-09-30 (used once, then removed from the hub) | none |
@@ -62,9 +62,10 @@ driver) shows red while under manual control.
 The bookcase ZSE40 (289) reports a capped percentage that the room's own lights push up by
 ~40 points, so it only counts while the lights are off (turn on below 50) and can never say
 "bright". The kitchen Hue sensor (41) reads real lux: turn on below 40, and a lit room may only
-turn off once it reads the daylight level (150). The bookcase cannot turn the room on while the
-kitchen is at daylight. Daytime dark-room debounce is 10 min, 3 min only in the last 90 min
-before sunset.
+turn off once it reads the daylight level (100 since v1.50; the lights add ~30 lux at that
+sensor). The bookcase can only turn the room on while the kitchen reads under its own ceiling
+(60, lights off); keep that at least 30 under the daylight level or the 2026-10-23 loop returns.
+Daytime dark-room debounce is 10 min, 3 min only in the last 90 min before sunset.
 
 ## Great Room: the Athom and the motion zone (v1.45)
 
