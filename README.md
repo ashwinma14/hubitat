@@ -8,7 +8,7 @@ deployed through the hub's MCP Rule Server (`importUrl`), with `deploy.sh` as th
 | File | App | Hub instance |
 |------|-----|--------------|
 | GreatRoomLighting.groovy | Great Room Lighting Controller (v1.50) | app:584 (Apps Code id 529) |
-| GoveeHolidayScenes.groovy | Govee Holiday Scenes (v1.8) — scene-by-date for the Govee string lights, deck lights and pathway bulbs | app:590 (Apps Code id 590) |
+| GoveeHolidayScenes.groovy | Govee Holiday Scenes (v1.9) — scene-by-date for the Govee string lights, deck lights and pathway bulbs | app:590 (Apps Code id 590) |
 | GreatRoomLightingLogger.gs | Google Apps Script webhook for Sheets logging | (Google) |
 | tools/LuxCsvRepair.groovy | One-off utility: rebuilt `lux_clean.csv` on 2026-09-30 (used once, then removed from the hub) | none |
 
@@ -104,6 +104,11 @@ sunset +1/+3/+6 min, and they are re-sent every 5 min while the plugs are on unt
 driver reports `cloudAPI=Success`). A two-color spec such as `alt:#8B00FF/#FF5500` alternates bulbs on the
 deck lights and paints a single bulb one color (436 = first color, 437 = second).
 Game days override everything with the Seahawks colors the same way.
+Since v1.9 a window's scene text may hold per-light rules separated by `;`: `Light name = alternatives`
+(label or device id; `*` or a bare rule is the fallback; lights with no rule keep the default scene).
+`off` switches a light off (it is switched back on when its next look arrives) and `default` means the
+default scene. Diwali 2026 (custom window 1, 11-01 to 11-08):
+`LED Bulb String Lights = Pastel; Front String Lights = off`.
 
 ## Motion Logger (Rule Machine rule 544)
 

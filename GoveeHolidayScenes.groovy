@@ -15,6 +15,11 @@
  *
  *  Author: Claude (for Ashwin)
  *  Date: 2026-09-29
+ *  Version: 1.9 - a window may say something different per light: rules separated by ';', each 'light = alternatives'
+ *                 (label or device id; '*' or a bare rule is the fallback, and lights with no rule keep the default
+ *                 scene), plus two new alternatives, 'off' (the light is switched off, and switched back on when its
+ *                 next look arrives) and 'default' (whatever the default scene gives this light). Diwali 2026:
+ *                 'LED Bulb String Lights = Pastel; Front String Lights = off', deck and pathway lights unchanged
  *  Version: 1.8 - single bulbs: a two-color pattern paints a whole bulb one of its colors (first/second, chosen per bulb),
  *                 so two pathway bulbs can be purple and orange next to the alternating deck lights; "self-powered"
  *                 lights (own sunset timer, photocell or wall switch, so no plug event) get a burst of sends right after
@@ -49,7 +54,7 @@ preferences {
     page(name: "mainPage")
 }
 
-def appVersion() { return "1.8" }
+def appVersion() { return "1.9" }
 
 def mainPage() {
     dynamicPage(name: "mainPage", title: "Govee Holiday Scenes v${appVersion()}", install: true, uninstall: true) {
@@ -81,6 +86,9 @@ def mainPage() {
             paragraph "Scene names must match the light's scene catalog (see Status below). Give alternatives separated by | and each light uses the first one it can do, e.g. 'Static warm white | White Light'. " +
                       "An alternative may also be a two-color bulb pattern, 'alt:#8B00FF/#FF5500' (even bulbs the first color, odd bulbs the second), which any light with per-bulb control can show without a DIY scene; " +
                       "a single bulb shows one of the two colors (chosen per bulb in the Lights section). " +
+                      "A window may treat lights differently: separate rules with ; and start a rule with the light's name (or device id) and =, " +
+                      "e.g. 'LED Bulb String Lights = Pastel; Front String Lights = off'. Lights without a rule keep the default scene (or the rule with no name, if there is one). " +
+                      "'off' switches a light off (it is switched back on when its next look arrives); 'default' means whatever the default scene gives that light. " +
                       "Windows are MM-DD and may wrap the year end (e.g. 11-27 to 01-06)."
             input "defaultScene", "text", title: "Default scene outside any window", defaultValue: "Static warm white", required: true, submitOnChange: true
             input "halloweenEnabled", "bool", title: "Halloween window", defaultValue: true, submitOnChange: true
@@ -321,16 +329,33 @@ def applyScenes(data) {
 }
 
 /**
- * One light's look for a spec of |-separated alternatives: the first alternative this light can do.
- * A scene name resolves when it is in the light's catalog; 'alt:#RRGGBB/#RRGGBB' resolves as even/odd bulbs on a light
- * with per-bulb control, or as one of the two colors on a single bulb.
- * Returns [type: "scene", id, name], [type: "alt", a, b], [type: "solid", color, slot, a, b] or null.
+ * One light's look for a spec. A spec is one or more rules separated by ';'. A rule is '<light> = <alternatives>' (the
+ * light's label or device id, or '*' for every light) or bare alternatives, which act as the fallback. A light with no
+ * rule and no fallback keeps the default scene. Alternatives are separated by '|' and the light takes the first it can
+ * do: a scene name in its catalog, 'alt:#RRGGBB/#RRGGBB' (even/odd bulbs with per-bulb control, else one of the two
+ * colors on a single bulb), 'off' (switch the light off) or 'default' (whatever the default scene gives this light).
+ * Returns [type: "scene", id, name], [type: "alt", a, b], [type: "solid", color, slot, a, b], [type: "off"] or null.
  */
 Map resolveLook(dev, String spec) {
-    if (!spec) return null
-    for (String alt : spec.split(/\|/)) {
+    return resolveSpec(dev, spec, 0)
+}
+
+Map resolveSpec(dev, String spec, int depth) {
+    String alts = alternativesFor(dev, spec)
+    if (alts == null) return null
+    for (String alt : alts.split(/\|/)) {
         String token = alt.trim()
         if (!token) continue
+        String lower = token.toLowerCase()
+        if (lower == "off") return [type: "off"]
+        if (lower in ["default", "normal"]) {
+            // the default scene may itself have rules; it may not point back at "default"
+            if (depth == 0 && defaultScene?.trim()) {
+                Map d = resolveSpec(dev, defaultScene, depth + 1)
+                if (d) return d
+            }
+            continue
+        }
         def m = (token =~ /(?i)^alt(?:ernate)?\s*:\s*(#?[0-9A-Fa-f]{6})\s*\/\s*(#?[0-9A-Fa-f]{6})$/)
         if (m.matches()) {
             Map two = twoColorLook(dev, normHex(m.group(1)), normHex(m.group(2)))
@@ -341,6 +366,30 @@ Map resolveLook(dev, String spec) {
         if (id != null) return [type: "scene", id: id, name: token]
     }
     return null
+}
+
+/** The |-alternatives that apply to this light: its own rule, else the fallback rule, else "default". Null for an empty spec. */
+String alternativesFor(dev, String spec) {
+    if (!spec?.trim()) return null
+    List rules = spec.split(/;/).collect { it.trim() }.findAll { it }
+    if (!rules) return null
+    if (rules.size() == 1 && !rules[0].contains("=")) return rules[0]
+    String fallback = null
+    for (String r : rules) {
+        int eq = r.indexOf("=")
+        if (eq < 0) { if (fallback == null) fallback = r; continue }
+        String target = r.substring(0, eq).trim()
+        String alts = r.substring(eq + 1).trim()
+        if (target == "*") { if (fallback == null) fallback = alts; continue }
+        if (matchesLight(dev, target)) return alts
+    }
+    return fallback != null ? fallback : "default"
+}
+
+boolean matchesLight(dev, String target) {
+    String t = target?.trim()?.toLowerCase()
+    if (!t) return false
+    return dev.id.toString() == t || dev.displayName?.toLowerCase() == t || (dev.label ?: "").toLowerCase() == t || dev.name?.toLowerCase() == t
 }
 
 /** How this light shows a two-color pattern: even/odd bulbs when it has segment control, else the whole bulb in its slot's color. */
@@ -372,13 +421,25 @@ Map gameLook(dev) {
 /** Stable identity of a look, used to remember which lights have confirmed it. */
 String lookKey(Map look) {
     if (look == null) return null
+    if (look.type == "off") return "off"
     if (look.type == "scene") return "scene:${look.id}"
     if (look.type == "solid") return "solid:${look.color}"
     return "alt:${look.a}/${look.b}"
 }
 
-/** Send one look to one light. Returns a short description for the log, or null when nothing was sent. */
+/** Send one look to one look's light. Returns a short description for the log, or null when nothing was sent. */
 String sendLook(dev, Map look) {
+    if (look?.type == "off") {
+        logDebug "${dev.displayName}: off()"
+        dev.off()
+        return "${dev.displayName}=off"
+    }
+    // A light this app switched off (a window rule) comes back on when its next look arrives; a plug power cycle leaves
+    // the driver's switch state stale, so this costs one extra command only while the driver still says off.
+    if (look != null && dev.currentValue("switch") == "off" && dev.hasCommand("on")) {
+        logDebug "${dev.displayName}: on() before its look (driver says off)"
+        dev.on()
+    }
     switch (look?.type) {
         case "scene":
             logDebug "${dev.displayName}: setEffect(${look.id}) for '${look.name}'"
@@ -619,7 +680,12 @@ def verifyScenes(data) {
         if (look == null) return
         String key = lookKey(look)
         String why = null
-        if (look.type == "scene") {
+        if (look.type == "off") {
+            def sw = dev.currentValue("switch")
+            def api = dev.currentValue("cloudAPI")
+            if (sw?.toString() != "off") why = "driver switch=${sw ?: 'none'}"
+            else if (api?.toString() != "Success") why = "driver cloudAPI=${api ?: 'none'}"
+        } else if (look.type == "scene") {
             def current = dev.currentValue("effectNum")
             if (current?.toString() != look.id.toString()) why = "driver effectNum=${current ?: 'none'}"
         } else if (look.type == "solid") {
@@ -872,6 +938,7 @@ String lookText(dev, String spec) {
 
 String lookDesc(dev, Map look) {
     if (look == null) return notFound()
+    if (look.type == "off") return "off"
     if (look.type == "alt") {
         def cnt = settings["segCount_${dev.id}".toString()] ?: 15
         return "alternate ${look.a} / ${look.b} (${cnt} bulbs)"
