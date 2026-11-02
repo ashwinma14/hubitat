@@ -15,6 +15,12 @@
  *
  *  Author: Claude (for Ashwin)
  *  Date: 2026-09-29
+ *  Version: 1.10 - 'ct:2700' as an alternative: a plain color temperature in kelvin (2700 = warm white), sent with
+ *                  setColorTemperature and verified through the driver's colorTemperature attribute. Govee's built-in
+ *                  "White Light" scene is cold on the deck lights, and a scene is not what a pathway bulb restores after
+ *                  its timer cuts power (they came back purple on 2026-11-01); a color temperature is a plain state the
+ *                  bulb keeps. Default is now 'GH-ILZ04Q | ct:2700': the bulb strings keep their DIY, deck and pathway
+ *                  bulbs are warm white
  *  Version: 1.9 - a window may say something different per light: rules separated by ';', each 'light = alternatives'
  *                 (label or device id; '*' or a bare rule is the fallback, and lights with no rule keep the default
  *                 scene), plus two new alternatives, 'off' (the light is switched off, and switched back on when its
@@ -54,7 +60,7 @@ preferences {
     page(name: "mainPage")
 }
 
-def appVersion() { return "1.9" }
+def appVersion() { return "1.10" }
 
 def mainPage() {
     dynamicPage(name: "mainPage", title: "Govee Holiday Scenes v${appVersion()}", install: true, uninstall: true) {
@@ -88,7 +94,8 @@ def mainPage() {
                       "a single bulb shows one of the two colors (chosen per bulb in the Lights section). " +
                       "A window may treat lights differently: separate rules with ; and start a rule with the light's name (or device id) and =, " +
                       "e.g. 'LED Bulb String Lights = Pastel; Front String Lights = off'. Lights without a rule keep the default scene (or the rule with no name, if there is one). " +
-                      "'off' switches a light off (it is switched back on when its next look arrives); 'default' means whatever the default scene gives that light. " +
+                      "'off' switches a light off (it is switched back on when its next look arrives); 'default' means whatever the default scene gives that light; " +
+                      "'ct:2700' is a plain color temperature in kelvin (2700 = warm white, 6500 = cold), which any light with a white channel can show and keeps across a power cut. " +
                       "Windows are MM-DD and may wrap the year end (e.g. 11-27 to 01-06)."
             input "defaultScene", "text", title: "Default scene outside any window", defaultValue: "Static warm white", required: true, submitOnChange: true
             input "halloweenEnabled", "bool", title: "Halloween window", defaultValue: true, submitOnChange: true
@@ -333,8 +340,10 @@ def applyScenes(data) {
  * light's label or device id, or '*' for every light) or bare alternatives, which act as the fallback. A light with no
  * rule and no fallback keeps the default scene. Alternatives are separated by '|' and the light takes the first it can
  * do: a scene name in its catalog, 'alt:#RRGGBB/#RRGGBB' (even/odd bulbs with per-bulb control, else one of the two
- * colors on a single bulb), 'off' (switch the light off) or 'default' (whatever the default scene gives this light).
- * Returns [type: "scene", id, name], [type: "alt", a, b], [type: "solid", color, slot, a, b], [type: "off"] or null.
+ * colors on a single bulb), 'ct:<kelvin>' (a plain color temperature), 'off' (switch the light off) or 'default'
+ * (whatever the default scene gives this light).
+ * Returns [type: "scene", id, name], [type: "alt", a, b], [type: "solid", color, slot, a, b], [type: "ct", kelvin],
+ * [type: "off"] or null.
  */
 Map resolveLook(dev, String spec) {
     return resolveSpec(dev, spec, 0)
@@ -362,10 +371,31 @@ Map resolveSpec(dev, String spec, int depth) {
             if (two) return two
             continue
         }
+        def ct = (token =~ /(?i)^ct\s*:\s*(\d{4,5})\s*k?$/)
+        if (ct.matches()) {
+            Map c = ctLook(dev, ct.group(1) as Integer)
+            if (c) return c
+            continue
+        }
         def id = resolveSceneId(dev, token)
         if (id != null) return [type: "scene", id: id, name: token]
     }
     return null
+}
+
+/** A plain color temperature, clamped to the light's own range so the driver's readback matches what was asked. */
+Map ctLook(dev, Integer kelvin) {
+    if (!dev.hasCommand("setColorTemperature")) return null
+    Integer k = kelvin
+    try {
+        def lo = dev.getDataValue("ctMin")
+        def hi = dev.getDataValue("ctMax")
+        if (lo && lo.toString().isInteger()) k = Math.max(k, lo.toString() as Integer)
+        if (hi && hi.toString().isInteger()) k = Math.min(k, hi.toString() as Integer)
+    } catch (e) {
+        logDebug "${dev.displayName}: no ct range (${e.message})"
+    }
+    return [type: "ct", kelvin: k]
 }
 
 /** The |-alternatives that apply to this light: its own rule, else the fallback rule, else "default". Null for an empty spec. */
@@ -422,6 +452,7 @@ Map gameLook(dev) {
 String lookKey(Map look) {
     if (look == null) return null
     if (look.type == "off") return "off"
+    if (look.type == "ct") return "ct:${look.kelvin}"
     if (look.type == "scene") return "scene:${look.id}"
     if (look.type == "solid") return "solid:${look.color}"
     return "alt:${look.a}/${look.b}"
@@ -441,6 +472,10 @@ String sendLook(dev, Map look) {
         dev.on()
     }
     switch (look?.type) {
+        case "ct":
+            logDebug "${dev.displayName}: setColorTemperature(${look.kelvin})"
+            dev.setColorTemperature(look.kelvin)
+            return "${dev.displayName}=${look.kelvin}K"
         case "scene":
             logDebug "${dev.displayName}: setEffect(${look.id}) for '${look.name}'"
             dev.setEffect(look.id)
@@ -685,7 +720,15 @@ def verifyScenes(data) {
             def api = dev.currentValue("cloudAPI")
             if (sw?.toString() != "off") why = "driver switch=${sw ?: 'none'}"
             else if (api?.toString() != "Success") why = "driver cloudAPI=${api ?: 'none'}"
+        } else if (look.type == "ct") {
+            def api = dev.currentValue("cloudAPI")
+            def ctv = dev.currentValue("colorTemperature")
+            if (api?.toString() != "Success") why = "driver cloudAPI=${api ?: 'none'}"
+            else if (ctv?.toString() != look.kelvin.toString()) why = "driver colorTemperature=${ctv ?: 'none'}"
         } else if (look.type == "scene") {
+            // effectNum only changes when the cloud accepts a different scene; a repeat of the last scene cannot be told
+            // from a failed send (a scene was confirmed on offline pathway bulbs on 2026-11-01 this way), so prefer
+            // ct:/alt:/solid looks for self-powered lights
             def current = dev.currentValue("effectNum")
             if (current?.toString() != look.id.toString()) why = "driver effectNum=${current ?: 'none'}"
         } else if (look.type == "solid") {
@@ -939,6 +982,7 @@ String lookText(dev, String spec) {
 String lookDesc(dev, Map look) {
     if (look == null) return notFound()
     if (look.type == "off") return "off"
+    if (look.type == "ct") return "${look.kelvin} K (${look.kelvin <= 3000 ? 'warm white' : look.kelvin >= 5000 ? 'cold white' : 'white'})"
     if (look.type == "alt") {
         def cnt = settings["segCount_${dev.id}".toString()] ?: 15
         return "alternate ${look.a} / ${look.b} (${cnt} bulbs)"
