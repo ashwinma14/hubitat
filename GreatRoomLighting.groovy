@@ -6,6 +6,9 @@
  *
  *  Author: Claude (for Ashwin)
  *  Date: 2026-02-12
+ *  Version: 1.51 - the room checks that it really went off: 15 s after turning everything off, anything still reporting
+ *                  "on" gets off() again, up to three times, then a warning (2026-11-05: the dining switch dropped its
+ *                  off() at 00:15 and burned at 30% until predawn)
  *  Version: 1.50 - the daylight bar is 100 lux, not 150, and the bookcase's kitchen ceiling is its own setting (60): the
  *                  living-room sensor may only turn the room on while the kitchen reads under 60 with the lights off, so
  *                  a room that turned off at 100 (about 70 without the lights) cannot be turned straight back on by the
@@ -92,7 +95,7 @@ preferences {
     page(name: "mainPage")
 }
 
-def appVersion() { return "1.50" }
+def appVersion() { return "1.51" }
 
 def mainPage() {
     dynamicPage(name: "mainPage", title: "Great Room Lighting Controller", install: true, uninstall: true) {
@@ -2229,6 +2232,37 @@ def turnAllLightsOff() {
     
     log.info "All lights turned off"
     safeLogToSheet("scene", "Off", "all lights off", currentLux)
+    state.offRetries = 0
+    runIn(15, "verifyAllOff")
+}
+
+/**
+ * A radio command can be lost: on 2026-11-05 the dining switch never acted on its off() at 00:15 and burned at 30%
+ * until predawn turned it off at 05:37. Look again after the room turns off and re-send to anything still on, a few
+ * times, unless a scene has come back in the meantime.
+ */
+def verifyAllOff() {
+    if (state.currentScene != "off") return
+    def stillOn = [diningSwitch, hallwaySwitch, kitchenCans, kitchenPendant, bookcaseGOLamp, bookcaseColorLamp, lrHueLights, activatorSwitch]
+            .findAll { it?.currentSwitch == "on" }
+    if (!stillOn) return
+    Integer n = ((state.offRetries ?: 0) as Integer) + 1
+    state.offRetries = n
+    String names = stillOn*.displayName.join(", ")
+    if (n > 3) {
+        log.warn "Still on after three more off commands: ${names} - the switch is not taking commands (radio or driver); check it"
+        safeLogToSheet("health", "off-failed", names, 0)
+        return
+    }
+    log.warn "Still on after the room turned off: ${names} - sending off again (${n} of 3)"
+    state.lastAutomationAction = now()
+    state.turningOff = true
+    stillOn.each { dev ->
+        noteCommand(dev, 0, 0)
+        dev.off()
+    }
+    runIn(3, clearTurningOffFlag)
+    runIn(n == 1 ? 15 : 60, "verifyAllOff")
 }
 
 def clearTurningOffFlag() {
