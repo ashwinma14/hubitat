@@ -6,6 +6,9 @@
  *
  *  Author: Claude (for Ashwin)
  *  Date: 2026-02-12
+ *  Version: 1.52 - party mode (a setting with an end date): a light somebody set by hand stays that way until the room
+ *                  turns off for an empty house; scene changes, mode changes, wind-down, TV time, app restarts, the
+ *                  time limit and the three-presses rule leave it alone
  *  Version: 1.51 - the room checks that it really went off: 15 s after turning everything off, anything still reporting
  *                  "on" gets off() again, up to three times, then a warning (2026-11-05: the dining switch dropped its
  *                  off() at 00:15 and burned at 30% until predawn)
@@ -95,7 +98,7 @@ preferences {
     page(name: "mainPage")
 }
 
-def appVersion() { return "1.51" }
+def appVersion() { return "1.52" }
 
 def mainPage() {
     dynamicPage(name: "mainPage", title: "Great Room Lighting Controller", install: true, uninstall: true) {
@@ -135,6 +138,10 @@ def mainPage() {
             input "presenceTimeout", "number", title: "Minutes before presence times out", defaultValue: 8, required: true
             input "manualOverrideMinutes", "number", title: "A switch press takes that one light out of the automation until the next scene change (predawn end, wind-down, mode change, TV time, everyone leaving) or this many minutes, whichever is first (0 = scene changes only). A press put back within 10 s counts for nothing; three presses in 30 s is play and the light is put back; a brighter press during the morning ramp becomes a floor the ramp continues from.", defaultValue: 360, required: true
             input "appChangesAreManual", "bool", title: "Changes from the Hue app, a dashboard or another app count as manual too (anything that is not this app's own command)", defaultValue: true
+            input "partyMode", "bool", title: "Party mode: a light somebody set by hand stays that way until the room turns off for an empty house. Scene changes, mode changes, wind-down, the time limit and the three-presses rule all leave it alone", defaultValue: false, submitOnChange: true
+            if (partyMode) {
+                input "partyEndDate", "text", title: "Party mode ends after this day (MM-DD; blank = until you switch it off)", required: false, width: 6
+            }
             input "overrideLedColor", "enum", title: "Switch LED color while a light is under manual control (Zooz ZEN7x switches with the Advanced driver only)", options: ["Red", "Green", "White", "Blue"], defaultValue: "Red", width: 4
             input "normalLedColor", "enum", title: "That switch's normal LED color", options: ["Blue", "White", "Green", "Red"], defaultValue: "Blue", width: 4
             input "normalLedMode", "enum", title: "Its normal LED mode", options: ["Default", "Reverse", "Off", "On"], defaultValue: "Default", width: 4
@@ -1491,7 +1498,7 @@ void handleManualChange(dev, Integer nowLevel, Integer expectedLevel) {
     presses[id] = [times: times, at: t]
     state.presses = presses
 
-    if (times.size() >= 3) {
+    if (times.size() >= 3 && !partyActive()) {
         dropOverride(dev)
         unschedule("restoreAfterPlay")
         log.info "${dev.displayName}: ${times.size()} presses in 30 s - somebody is playing with it; no override, back to the scene in 20 s"
@@ -1514,7 +1521,21 @@ void handleManualChange(dev, Integer nowLevel, Integer expectedLevel) {
         return
     }
     addOverride(dev)
-    log.info "${dev.displayName} is left alone until the next scene change (${manualOverrideMinutes ?: 360} min at most); the rest of the room carries on"
+    if (partyActive()) log.info "${dev.displayName} is left alone until the room turns off (party mode); the rest of the room carries on"
+    else log.info "${dev.displayName} is left alone until the next scene change (${manualOverrideMinutes ?: 360} min at most); the rest of the room carries on"
+}
+
+/**
+ * Party mode: manual settings hold until the room turns off for an empty house. Switches itself off after partyEndDate.
+ * 2026-11-07: a party weekend where the scene changes, wind-down and the six-hour limit must not undo the mood lighting.
+ */
+boolean partyActive() {
+    if (!partyMode) return false
+    String end = partyEndDate?.trim()
+    if (!end) return true
+    if (!(end ==~ /^(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])$/)) return true
+    String today = new Date().format("MM-dd", location.timeZone)
+    return today <= end
 }
 
 def restoreAfterPlay() {
@@ -1575,7 +1596,7 @@ boolean overridden(dev) {
     Map o = (state.overrides ?: [:]) as Map
     def until = o[dev.id.toString()]
     if (until == null) return false
-    if ((until as Long) <= now()) {
+    if ((until as Long) <= now() && !partyActive()) {
         dropOverride(dev)
         log.info "${dev.displayName}: manual override expired - back under automation"
         return false
@@ -1585,6 +1606,10 @@ boolean overridden(dev) {
 
 void clearOverrides(String reason) {
     Map o = (state.overrides ?: [:]) as Map
+    if (o && partyActive() && !(reason in ["room turning off", "everyone left"])) {
+        log.info "Party mode: manual settings kept through ${reason} (${overrideText()})"
+        return
+    }
     if (o) {
         log.info "Manual overrides cleared (${reason}): ${overrideText()}"
         overrideDevices().each { showOverrideLed(it, false) }
@@ -1984,7 +2009,8 @@ String adaptiveStatus() {
     return "Outdoor ${lux != null ? lux + ' lux' : 'sensor missing'}${fault}: band ${rawAmbientFactor()}%, applied factor ${state.ambientFactor ?: '-'}%${floor}; " +
            "${ramp}; predawn ends ${predawnAt} today; scene now: ${state.currentScene ?: 'off'}; " +
            "cans ${cansDimmable() ? 'dim with the room' : 'on/off'}${((cansFactor ?: 0) as Integer) > 0 ? ' from a ' + cansFactor + '% factor' : ''}; " +
-           "manual overrides: ${overrideText()}"
+           "manual overrides: ${overrideText()}" +
+           (partyActive() ? "; <b>PARTY MODE</b> (manual settings hold until the room turns off" + (partyEndDate?.trim() ? ", through ${partyEndDate.trim()}" : "") + ")" : "")
 }
 
 // ==================== SCENE ACTIONS ====================

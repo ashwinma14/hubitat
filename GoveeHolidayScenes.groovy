@@ -15,6 +15,8 @@
  *
  *  Author: Claude (for Ashwin)
  *  Date: 2026-09-29
+ *  Version: 1.11 - early power-on dates: on listed days the plugs are switched on at a set time (15:00) instead of
+ *                  waiting for the dusk automation; the dusk automation still turns them off in the morning
  *  Version: 1.10 - 'ct:2700' as an alternative: a plain color temperature in kelvin (2700 = warm white), sent with
  *                  setColorTemperature and verified through the driver's colorTemperature attribute. Govee's built-in
  *                  "White Light" scene is cold on the deck lights, and a scene is not what a pathway bulb restores after
@@ -60,7 +62,7 @@ preferences {
     page(name: "mainPage")
 }
 
-def appVersion() { return "1.10" }
+def appVersion() { return "1.11" }
 
 def mainPage() {
     dynamicPage(name: "mainPage", title: "Govee Holiday Scenes v${appVersion()}", install: true, uninstall: true) {
@@ -85,6 +87,10 @@ def mainPage() {
                 if (selfSunset != false) {
                     input "selfSunsetOffset", "number", title: "Minutes after the hub's sunset (${sunsetText()}) for the first send; the burst repeats +2 and +5 min later", defaultValue: 1, required: true, width: 6
                 }
+            }
+            input "earlyOnDates", "text", title: "Early power-on dates (MM-DD, comma separated; blank = none): on these days the plugs above are switched on at the time below instead of waiting for dusk. The dusk automation still turns them off in the morning", required: false, submitOnChange: true
+            if (earlyOnDates?.trim()) {
+                input "earlyOnTime", "text", title: "Early power-on time (HH:mm, 24h)", defaultValue: "15:00", required: true, width: 4
             }
         }
 
@@ -194,6 +200,7 @@ def initialize() {
     schedule("0 5 0 * * ?", "dailyRollover")
     state.gameWindowActive = false
     scheduleTodaysGame()
+    scheduleEarlyOn()
 
     if (logEnable && (logEnableMinutes ?: 0) > 0) {
         runIn((logEnableMinutes as Integer) * 60, "logsOff")
@@ -276,6 +283,7 @@ def gameHandler(evt) {
 
 def dailyRollover() {
     scheduleTodaysGame()
+    scheduleEarlyOn()
     if (appPaused) return
     if (!anyPowerOn()) { logDebug "Rollover: lights unpowered"; return }
     def target = targetSceneName()
@@ -284,6 +292,41 @@ def dailyRollover() {
     state.retryStartedAt = now()
     runIn(2, "applyScenes", [data: [reason: "date rollover", attempt: 1], overwrite: false])
     runIn(62, "applyScenes", [data: [reason: "date rollover", attempt: 2], overwrite: false])
+}
+
+/**
+ * Early power-on: on listed dates the plugs are switched on at a set time instead of waiting for the dusk automation
+ * (2026-11-07/08: a party weekend, lights on at 15:00). Room Lighting only acts on its "illuminance rises" turn-off
+ * while it believes it activated the lights, so switching the plugs on from here does not start a fight; it still
+ * turns them off in the morning as usual. The plugs' own switch.on events then run the normal scene sends.
+ */
+def scheduleEarlyOn() {
+    unschedule("earlyPowerOn")
+    String dates = earlyOnDates?.trim()
+    if (!dates) return
+    String today = new Date().format("MM-dd", location.timeZone)
+    List days = dates.split(/[,\s]+/).collect { it.trim() }.findAll { it }
+    days.findAll { !validDate(it) }.each { log.warn "Early power-on date '${it}' is not MM-DD; ignored" }
+    if (!(today in days)) return
+    String t = (earlyOnTime ?: "15:00").trim()
+    def tm = (t =~ /^([01]?\d|2[0-3]):([0-5]\d)$/)
+    if (!tm.matches()) { log.warn "Early power-on time '${t}' is not HH:mm; ignored"; return }
+    Calendar cal = Calendar.getInstance(location.timeZone)
+    cal.set(Calendar.HOUR_OF_DAY, tm.group(1) as Integer)
+    cal.set(Calendar.MINUTE, tm.group(2) as Integer)
+    cal.set(Calendar.SECOND, 0)
+    cal.set(Calendar.MILLISECOND, 0)
+    if (cal.time.time <= now()) { logDebug "Early power-on time ${t} already passed today"; return }
+    runOnce(cal.time, "earlyPowerOn")
+    log.info "Early power-on today at ${t} (${powerSwitches*.displayName.join(', ')})"
+}
+
+def earlyPowerOn() {
+    if (appPaused) return
+    def off = powerSwitches.findAll { it.currentValue("switch") != "on" }
+    if (!off) { log.info "Early power-on: the plugs are already on"; return }
+    log.info "Early power-on: switching on ${off*.displayName.join(', ')}"
+    off.each { it.on() }
 }
 
 def appButtonHandler(String btn) {

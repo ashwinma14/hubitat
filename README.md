@@ -7,8 +7,8 @@ deployed through the hub's MCP Rule Server (`importUrl`), with `deploy.sh` as th
 
 | File | App | Hub instance |
 |------|-----|--------------|
-| GreatRoomLighting.groovy | Great Room Lighting Controller (v1.51) | app:584 (Apps Code id 529) |
-| GoveeHolidayScenes.groovy | Govee Holiday Scenes (v1.10) — scene-by-date for the Govee string lights, deck lights and pathway bulbs | app:590 (Apps Code id 590) |
+| GreatRoomLighting.groovy | Great Room Lighting Controller (v1.52) | app:584 (Apps Code id 529) |
+| GoveeHolidayScenes.groovy | Govee Holiday Scenes (v1.11) — scene-by-date for the Govee string lights, deck lights and pathway bulbs | app:590 (Apps Code id 590) |
 | GreatRoomLightingLogger.gs | Google Apps Script webhook for Sheets logging | (Google) |
 | tools/LuxCsvRepair.groovy | One-off utility: rebuilt `lux_clean.csv` on 2026-09-30 (used once, then removed from the hub) | none |
 
@@ -93,6 +93,12 @@ for `lrMmwaveEmptyMinutes` (20) with no living-room motion in that time, and the
 the normal timeout ends the room (a 2026-10-25 walk-out through an uncovered door kept the lights
 on for the full 90-minute backstop). A blip restarts the 20 minutes.
 
+## Great Room: party mode (v1.52)
+
+`partyMode` (with `partyEndDate`, MM-DD): a light somebody set by hand stays that way until the room
+turns off for an empty house; scene changes, mode changes, wind-down, TV time, app restarts, the
+six-hour limit and the three-presses rule leave it alone. First used 2026-11-07/08.
+
 ## Govee Holiday Scenes (app 590)
 
 Lights: string lights 433 (H7021, 96 ft, 30 bulbs), deck lights 434 (H7067, 15), Front String
@@ -104,6 +110,9 @@ sunset +1/+3/+6 min, and they are re-sent every 5 min while the plugs are on unt
 driver reports `cloudAPI=Success`). A two-color spec such as `alt:#8B00FF/#FF5500` alternates bulbs on the
 deck lights and paints a single bulb one color (436 = first color, 437 = second).
 Game days override everything with the Seahawks colors the same way.
+Since v1.11 `earlyOnDates` (MM-DD list) + `earlyOnTime` switch the plugs on at that time on those
+days instead of waiting for dusk; Room Lighting ignores its lux turn-off while it did not activate the
+lights itself, and still turns them off in the morning. First used 2026-11-07/08 at 15:00.
 Since v1.9 a window's scene text may hold per-light rules separated by `;`: `Light name = alternatives`
 (label or device id; `*` or a bare rule is the fallback; lights with no rule keep the default scene).
 `off` switches a light off (it is switched back on when its next look arrives), `default` means the
