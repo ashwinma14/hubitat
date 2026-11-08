@@ -15,6 +15,8 @@
  *
  *  Author: Claude (for Ashwin)
  *  Date: 2026-09-29
+ *  Version: 1.14 - sunset (and the Apply button) restart the self-powered re-send budget: on a dark day the plugs never
+ *                  cycle and the six hours were spent before the timer bulbs had power
  *  Version: 1.13 - a 'ct:' look on a light with per-segment control paints every segment with the temperature's RGB
  *                  before setting the temperature (segment colors survived a week of accepted 2700 K commands)
  *  Version: 1.12 - a removed game date ('-YYYY-MM-DD') also silences the calendar switch that day
@@ -65,7 +67,7 @@ preferences {
     page(name: "mainPage")
 }
 
-def appVersion() { return "1.13" }
+def appVersion() { return "1.14" }
 
 def mainPage() {
     dynamicPage(name: "mainPage", title: "Govee Holiday Scenes v${appVersion()}", install: true, uninstall: true) {
@@ -335,6 +337,8 @@ def earlyPowerOn() {
 def appButtonHandler(String btn) {
     switch (btn) {
         case "btnApply":
+            state.retryStartedAt = now()
+            state.selfRetryCount = 0
             applyScenes([reason: "manual", attempt: 1])
             break
         case "btnReload":
@@ -893,6 +897,10 @@ def retrySelfPowered() {
 /** Sunset (the location event): send to the self-powered lights at +offset, +offset+2 and +offset+5 minutes; a miss falls back to the loop. */
 def sunsetHandler(evt) {
     if (appPaused || !selfPoweredLights()) return
+    // The re-send budget is "hours since the plugs turned on", which assumes the plugs cycle daily. On a dark day they
+    // stay on and the budget is spent before the timer lights ever get power (2026-11-08), so sunset restarts it.
+    state.retryStartedAt = now()
+    state.selfRetryCount = 0
     int off = Math.max(0, (selfSunsetOffset ?: 1) as Integer) * 60
     [0, 120, 300].each { runIn(off + it, "sunsetSend", [overwrite: false]) }
     logDebug "Sunset: self-powered sends at +${off}s, +${off + 120}s and +${off + 300}s"
