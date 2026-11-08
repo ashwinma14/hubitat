@@ -6,6 +6,8 @@
  *
  *  Author: Claude (for Ashwin)
  *  Date: 2026-02-12
+ *  Version: 1.54 - party mode: a brightness turn-off leaves hand-set lights alone (only an empty house turns them off),
+ *                  and the off-verification never re-sends off to a light somebody has switched on since
  *  Version: 1.53 - party mode takes a day and a time window (13:00-18:00 on 11-08); at the end time hand-set lights go
  *                  back to the automation
  *  Version: 1.52 - party mode (a setting with an end date): a light somebody set by hand stays that way until the room
@@ -100,7 +102,7 @@ preferences {
     page(name: "mainPage")
 }
 
-def appVersion() { return "1.53" }
+def appVersion() { return "1.54" }
 
 def mainPage() {
     dynamicPage(name: "mainPage", title: "Great Room Lighting Controller", install: true, uninstall: true) {
@@ -1990,6 +1992,8 @@ def ambientRecheck() {
  */
 def brightRoomSafetyNet() {
     if (appPaused || !roomIsOn() || !state.presenceActive || state.tvTimeActive || state.pendingBrightOff) return
+    // Only hand-set lights on in party mode: nothing for the automation to turn off
+    if (partyActive() && ![hallwaySwitch, kitchenPendant, lrHueLights, diningSwitch].any { it?.currentSwitch == "on" && !overridden(it) }) return
     state.lightNeeded = isLightNeeded()
     if (state.lightNeeded) return
     state.pendingBrightOff = true
@@ -2263,29 +2267,27 @@ def applyTvScene() {
 }
 
 def turnAllLightsOff() {
+    // Party mode with people still here: this is a brightness turn-off, and lights somebody set by hand are theirs
+    // (2026-11-08 14:56: the room read bright, turned everything off and then fought the switches people pressed).
+    // With the house empty, everything goes off as usual.
+    boolean keepHandSet = partyActive() && state.presenceActive
+    def all = [diningSwitch, hallwaySwitch, kitchenCans, kitchenPendant, bookcaseGOLamp, bookcaseColorLamp, lrHueLights, activatorSwitch].findAll { it }
+    def targets = keepHandSet ? all.findAll { !overridden(it) } : all
     // Skip when everything is already off - avoids repeated radio commands and duplicate log rows
-    def anyOn = [diningSwitch, hallwaySwitch, kitchenCans, kitchenPendant,
-                 bookcaseGOLamp, bookcaseColorLamp, lrHueLights, activatorSwitch].any { it?.currentSwitch == "on" }
-    if (!anyOn) {
-        logDebug "turnAllLightsOff: everything already off - skipping"
+    if (!targets.any { it.currentSwitch == "on" }) {
+        logDebug "turnAllLightsOff: nothing to turn off" + (keepHandSet ? " (hand-set lights kept: ${overrideText()})" : "")
         return
     }
     state.lastAutomationAction = now()
     state.turningOff = true
     def currentLux = luxSensor?.currentIlluminance ?: 0
-    clearOverrides("room turning off")
+    if (!keepHandSet) clearOverrides("room turning off")
+    else log.info "Party mode: turning the room off but leaving the hand-set lights alone (${overrideText()})"
     state.rampFloor = null
-    [diningSwitch, hallwaySwitch, kitchenCans, kitchenPendant, bookcaseGOLamp, bookcaseColorLamp, lrHueLights].each { noteCommand(it, 0, 0) }
+    targets.each { noteCommand(it, 0, 0) }
 
     unschedule("cansOnDelayed")
-    diningSwitch?.off()
-    hallwaySwitch?.off()
-    kitchenCans?.off()
-    kitchenPendant?.off()
-    bookcaseGOLamp?.off()
-    bookcaseColorLamp?.off()
-    lrHueLights?.off()
-    activatorSwitch?.off()
+    targets.each { it.off() }
     
     // Clear the turningOff flag after a delay
     runIn(3, clearTurningOffFlag)
@@ -2309,8 +2311,9 @@ def turnAllLightsOff() {
  */
 def verifyAllOff() {
     if (state.currentScene != "off") return
+    // A light somebody switched on since the room went off is theirs (it is under manual override), not a lost command
     def stillOn = [diningSwitch, hallwaySwitch, kitchenCans, kitchenPendant, bookcaseGOLamp, bookcaseColorLamp, lrHueLights, activatorSwitch]
-            .findAll { it?.currentSwitch == "on" }
+            .findAll { it?.currentSwitch == "on" && !overridden(it) }
     if (!stillOn) return
     Integer n = ((state.offRetries ?: 0) as Integer) + 1
     state.offRetries = n
