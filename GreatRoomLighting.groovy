@@ -6,6 +6,8 @@
  *
  *  Author: Claude (for Ashwin)
  *  Date: 2026-02-12
+ *  Version: 1.55 - "lights on" for the kitchen sensor's reading means any of the room's lights, not only the dining
+ *                  and cans (the pendant at 100% put the sensor at 54 lux and the app read it as daylight)
  *  Version: 1.54 - party mode: a brightness turn-off leaves hand-set lights alone (only an empty house turns them off),
  *                  and the off-verification never re-sends off to a light somebody has switched on since
  *  Version: 1.53 - party mode takes a day and a time window (13:00-18:00 on 11-08); at the end time hand-set lights go
@@ -102,7 +104,7 @@ preferences {
     page(name: "mainPage")
 }
 
-def appVersion() { return "1.54" }
+def appVersion() { return "1.55" }
 
 def mainPage() {
     dynamicPage(name: "mainPage", title: "Great Room Lighting Controller", install: true, uninstall: true) {
@@ -497,7 +499,11 @@ def isLightNeeded() {
     // The ceiling sits under the daylight level by more than the lights add at the kitchen sensor, so a room that just
     // turned off for daylight cannot be turned straight back on by the bookcase (2026-11-01: 109 lux with the lights on,
     // ~79 without, dull but lit; the old 150 bar kept the room on all day).
-    def lightsCurrentlyOn = (diningSwitch?.currentSwitch == "on" || kitchenCans?.currentSwitch == "on")
+    // Any of the room's lights lifts the kitchen sensor (the pendant most of all), so all of them count, not just the
+    // two wired kitchen circuits: on 2026-11-08 the pendant was on at 100%, the sensor read 54 lux, and with only the
+    // dining and cans checked the app took that as daylight and turned the room off
+    def lightsCurrentlyOn = (diningSwitch?.currentSwitch == "on" || kitchenCans?.currentSwitch == "on" ||
+                             kitchenPendant?.currentSwitch == "on" || hallwaySwitch?.currentSwitch == "on" || lrHueLights?.currentSwitch == "on")
     boolean kitchenDark = sensorDark(indoorLuxSensor2, indoorLuxThreshold2 ?: 40, lightsCurrentlyOn)
     boolean bookcaseDark = sensorDark(indoorLuxSensor, indoorLuxThreshold ?: 50, lightsCurrentlyOn)
     boolean indoorNeedsLight = kitchenDark || (bookcaseDark && !kitchenAboveCeiling())
