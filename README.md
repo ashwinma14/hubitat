@@ -8,7 +8,7 @@ deployed through the hub's MCP Rule Server (`importUrl`), with `deploy.sh` as th
 | File | App | Hub instance |
 |------|-----|--------------|
 | GreatRoomLighting.groovy | Great Room Lighting Controller (v1.53) | app:584 (Apps Code id 529) |
-| GoveeHolidayScenes.groovy | Govee Holiday Scenes (v1.12) — scene-by-date for the Govee string lights, deck lights and pathway bulbs | app:590 (Apps Code id 590) |
+| GoveeHolidayScenes.groovy | Govee Holiday Scenes (v1.13) — scene-by-date for the Govee string lights, deck lights and pathway bulbs | app:590 (Apps Code id 590) |
 | GreatRoomLightingLogger.gs | Google Apps Script webhook for Sheets logging | (Google) |
 | tools/LuxCsvRepair.groovy | One-off utility: rebuilt `lux_clean.csv` on 2026-09-30 (used once, then removed from the hub) | none |
 
@@ -118,7 +118,10 @@ Since v1.9 a window's scene text may hold per-light rules separated by `;`: `Lig
 `off` switches a light off (it is switched back on when its next look arrives), `default` means the
 default scene, and `ct:2700` is a plain color temperature (verified through the driver's colorTemperature;
 a scene cannot be verified when it repeats the last one, and a pathway bulb does not restore a scene after
-its timer cuts power, so the bulbs and the deck lights use `ct:2700`). Default since 2026-11-01:
+its timer cuts power, so the bulbs and the deck lights use `ct:2700`). On a light with per-segment control
+the `ct:` look first paints every segment with the temperature's RGB: segment colors survive a whole-light
+color-temperature command on the RGBIC deck lights (they kept the game colors through a week of accepted
+2700 K commands, 2026-11-02 to 11-07). Default since 2026-11-01:
 `GH-ILZ04Q | ct:2700` (the bulb strings keep their DIY, deck and pathway bulbs warm white). Diwali 2026 (custom window 1, 11-01 to 11-08):
 `LED Bulb String Lights = Pastel; Front String Lights = off`.
 

@@ -15,6 +15,8 @@
  *
  *  Author: Claude (for Ashwin)
  *  Date: 2026-09-29
+ *  Version: 1.13 - a 'ct:' look on a light with per-segment control paints every segment with the temperature's RGB
+ *                  before setting the temperature (segment colors survived a week of accepted 2700 K commands)
  *  Version: 1.12 - a removed game date ('-YYYY-MM-DD') also silences the calendar switch that day
  *  Version: 1.11 - early power-on dates: on listed days the plugs are switched on at a set time (15:00) instead of
  *                  waiting for the dusk automation; the dusk automation still turns them off in the morning
@@ -63,7 +65,7 @@ preferences {
     page(name: "mainPage")
 }
 
-def appVersion() { return "1.12" }
+def appVersion() { return "1.13" }
 
 def mainPage() {
     dynamicPage(name: "mainPage", title: "Govee Holiday Scenes v${appVersion()}", install: true, uninstall: true) {
@@ -517,6 +519,13 @@ String sendLook(dev, Map look) {
     }
     switch (look?.type) {
         case "ct":
+            // Per-segment colors survive a whole-light color-temperature command on RGBIC strings: the deck lights kept
+            // the game colors through a week of accepted 2700 K commands (2026-11-02 to 11-07). Paint every segment with
+            // the temperature's RGB first, which is the one command those lights always follow, then set the temperature.
+            if (dev.hasCommand("segmentedColorRgb")) {
+                String hex = kelvinHex(look.kelvin)
+                paintAll(dev, hex)
+            }
             logDebug "${dev.displayName}: setColorTemperature(${look.kelvin})"
             dev.setColorTemperature(look.kelvin)
             return "${dev.displayName}=${look.kelvin}K"
@@ -564,6 +573,33 @@ boolean paintSolid(dev, String hex) {
     logDebug "${dev.displayName}: setColor(${c}) for ${hex}"
     dev.setColor(c)
     return true
+}
+
+/** Paint every segment one color through the driver's per-segment command. */
+void paintAll(dev, String hex) {
+    Map c = hexToColorMap(hex)
+    if (!c) return
+    int first = (gameFirstBulb ?: 0) as Integer
+    int count = Math.max(2, (settings["segCount_${dev.id}".toString()] ?: 15) as Integer)
+    def all = (0..<count).collect { it + first }
+    logDebug "${dev.displayName}: segments ${all} <- ${hex}"
+    dev.segmentedColorRgb(all.toString(), c)
+}
+
+/** The RGB a Govee RGBIC light shows for a color temperature, as #RRGGBB (2700 K amber-white up to 6500 K white). */
+String kelvinHex(Integer kelvin) {
+    List anchors = [[2000, [255, 141, 11]], [2700, [255, 180, 107]], [3000, [255, 197, 143]], [4000, [255, 214, 170]],
+                    [5000, [255, 228, 206]], [6500, [255, 255, 255]]]
+    int k = Math.max(2000, Math.min(6500, kelvin ?: 2700))
+    def lo = anchors.findAll { it[0] <= k }.last()
+    def hi = anchors.find { it[0] >= k }
+    List rgb
+    if (lo[0] == hi[0]) rgb = lo[1]
+    else {
+        double f = (k - lo[0]) / (double) (hi[0] - lo[0])
+        rgb = (0..2).collect { i -> Math.round(lo[1][i] + f * (hi[1][i] - lo[1][i])) as Integer }
+    }
+    return String.format("#%02X%02X%02X", rgb[0], rgb[1], rgb[2])
 }
 
 /** Paint even bulbs color A and odd bulbs color B through the driver's per-segment command. Returns the bulb count used. */
