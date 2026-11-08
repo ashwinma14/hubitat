@@ -15,6 +15,7 @@
  *
  *  Author: Claude (for Ashwin)
  *  Date: 2026-09-29
+ *  Version: 1.12 - a removed game date ('-YYYY-MM-DD') also silences the calendar switch that day
  *  Version: 1.11 - early power-on dates: on listed days the plugs are switched on at a set time (15:00) instead of
  *                  waiting for the dusk automation; the dusk automation still turns them off in the morning
  *  Version: 1.10 - 'ct:2700' as an alternative: a plain color temperature in kelvin (2700 = warm white), sent with
@@ -62,7 +63,7 @@ preferences {
     page(name: "mainPage")
 }
 
-def appVersion() { return "1.11" }
+def appVersion() { return "1.12" }
 
 def mainPage() {
     dynamicPage(name: "mainPage", title: "Govee Holiday Scenes v${appVersion()}", install: true, uninstall: true) {
@@ -130,7 +131,7 @@ def mainPage() {
                 input "gameAllNight", "bool", title: "Keep the game look until the lights go off for the night (otherwise it ends a fixed time after kickoff)", defaultValue: true, submitOnChange: true
                 input "gameLeadMinutes", "number", title: "Start the game look this many minutes before kickoff", defaultValue: 30, required: true, width: 6
                 input "gameHoldMinutes", "number", title: gameAllNight == false ? "End it this many minutes after kickoff" : "Earliest a power-off may end game night (minutes after kickoff)", defaultValue: 240, required: true, width: 6
-                input "extraGames", "textarea", title: "Schedule changes, one per line: 'YYYY-MM-DD HH:mm label' adds or replaces a game (flex moves, playoffs); '-YYYY-MM-DD' removes one", required: false, submitOnChange: true
+                input "extraGames", "textarea", title: "Schedule changes, one per line: 'YYYY-MM-DD HH:mm label' adds or replaces a game (flex moves, playoffs); '-YYYY-MM-DD' removes one (no game look that day, from the schedule or the switch below)", required: false, submitOnChange: true
                 paragraph "Next game: ${nextGameText()}"
             }
             input "gameSwitch", "capability.switch", title: "Also treat this switch being on as game time (optional, e.g. a calendar-driven Seahawks_Game switch)", required: false, submitOnChange: true
@@ -595,7 +596,14 @@ Map hexToColorMap(String hex) {
 
 boolean gameActive() {
     if (scheduleEnabled && state.gameWindowActive) return true
-    return gameSwitch && gameSwitch.currentValue("switch") == "on"
+    if (!gameSwitch || gameSwitch.currentValue("switch") != "on") return false
+    // '-YYYY-MM-DD' in the schedule changes means no game look that day from any source; the calendar switch alone
+    // would otherwise bring it back (2026-11-08: Diwali party during the Cardinals game)
+    return !removedGameDates().contains(new Date().format("yyyy-MM-dd", location.timeZone))
+}
+
+List removedGameDates() {
+    return (extraGames ?: "").split(/\r?\n/).collect { it.trim() }.findAll { it.startsWith("-") }.collect { it.substring(1).trim() }
 }
 
 
