@@ -6,6 +6,8 @@
  *
  *  Author: Claude (for Ashwin)
  *  Date: 2026-02-12
+ *  Version: 1.53 - party mode takes a day and a time window (13:00-18:00 on 11-08); at the end time hand-set lights go
+ *                  back to the automation
  *  Version: 1.52 - party mode (a setting with an end date): a light somebody set by hand stays that way until the room
  *                  turns off for an empty house; scene changes, mode changes, wind-down, TV time, app restarts, the
  *                  time limit and the three-presses rule leave it alone
@@ -98,7 +100,7 @@ preferences {
     page(name: "mainPage")
 }
 
-def appVersion() { return "1.52" }
+def appVersion() { return "1.53" }
 
 def mainPage() {
     dynamicPage(name: "mainPage", title: "Great Room Lighting Controller", install: true, uninstall: true) {
@@ -140,7 +142,9 @@ def mainPage() {
             input "appChangesAreManual", "bool", title: "Changes from the Hue app, a dashboard or another app count as manual too (anything that is not this app's own command)", defaultValue: true
             input "partyMode", "bool", title: "Party mode: a light somebody set by hand stays that way until the room turns off for an empty house. Scene changes, mode changes, wind-down, the time limit and the three-presses rule all leave it alone", defaultValue: false, submitOnChange: true
             if (partyMode) {
-                input "partyEndDate", "text", title: "Party mode ends after this day (MM-DD; blank = until you switch it off)", required: false, width: 6
+                input "partyDate", "text", title: "Party day (MM-DD; blank = every day while party mode is on)", required: false, width: 4
+                input "partyFrom", "text", title: "From (HH:mm; blank = all day)", required: false, width: 4
+                input "partyTo", "text", title: "To (HH:mm; blank = all day). When the party ends, hand-set lights go back to the automation", required: false, width: 4
             }
             input "overrideLedColor", "enum", title: "Switch LED color while a light is under manual control (Zooz ZEN7x switches with the Advanced driver only)", options: ["Red", "Green", "White", "Blue"], defaultValue: "Red", width: 4
             input "normalLedColor", "enum", title: "That switch's normal LED color", options: ["Blue", "White", "Green", "Red"], defaultValue: "Blue", width: 4
@@ -389,6 +393,8 @@ def initialize() {
     // Predawn ends at the earlier of the configured time and (sunrise - offset); re-armed just after midnight
     schedule("0 1 0 * * ?", armPredawnEnd)
     armPredawnEnd()
+    schedule("0 2 0 * * ?", armPartyEnd)
+    armPartyEnd()
 
     // Adaptive brightness bookkeeping
     // Start from the current band when the room is off; a lit room keeps its committed factor so an app update
@@ -1526,16 +1532,49 @@ void handleManualChange(dev, Integer nowLevel, Integer expectedLevel) {
 }
 
 /**
- * Party mode: manual settings hold until the room turns off for an empty house. Switches itself off after partyEndDate.
+ * Party mode: manual settings hold until the room turns off for an empty house, on the party day within the party hours.
  * 2026-11-07: a party weekend where the scene changes, wind-down and the six-hour limit must not undo the mood lighting.
  */
 boolean partyActive() {
     if (!partyMode) return false
-    String end = partyEndDate?.trim()
-    if (!end) return true
-    if (!(end ==~ /^(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])$/)) return true
-    String today = new Date().format("MM-dd", location.timeZone)
-    return today <= end
+    String d = partyDate?.trim()
+    if (d && d ==~ /^(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])$/ && new Date().format("MM-dd", location.timeZone) != d) return false
+    Integer from = hhmmMinutes(partyFrom), to = hhmmMinutes(partyTo)
+    if (from == null || to == null) return true
+    def cal = java.util.Calendar.getInstance(location.timeZone)
+    Integer nowMins = cal.get(java.util.Calendar.HOUR_OF_DAY) * 60 + cal.get(java.util.Calendar.MINUTE)
+    return from <= to ? (nowMins >= from && nowMins < to) : (nowMins >= from || nowMins < to)
+}
+
+/** "HH:mm" to minutes after midnight, or null when blank or malformed. */
+Integer hhmmMinutes(String t) {
+    def m = (t?.trim() ?: "") =~ /^([01]?\d|2[0-3]):([0-5]\d)$/
+    return m.matches() ? (m.group(1) as Integer) * 60 + (m.group(2) as Integer) : null
+}
+
+/** At the party's end time (on the party day, or every day), hand-set lights go back to the automation. */
+def armPartyEnd() {
+    unschedule("partyEnded")
+    if (!partyMode) return
+    Integer to = hhmmMinutes(partyTo)
+    if (to == null) return
+    String d = partyDate?.trim()
+    if (d && d ==~ /^(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])$/ && new Date().format("MM-dd", location.timeZone) != d) return
+    def cal = java.util.Calendar.getInstance(location.timeZone)
+    Integer nowMins = cal.get(java.util.Calendar.HOUR_OF_DAY) * 60 + cal.get(java.util.Calendar.MINUTE)
+    if (nowMins >= to) return
+    def t = java.util.Calendar.getInstance(location.timeZone)
+    t.set(java.util.Calendar.HOUR_OF_DAY, (to / 60) as Integer)
+    t.set(java.util.Calendar.MINUTE, to % 60)
+    t.set(java.util.Calendar.SECOND, 0)
+    runOnce(t.getTime(), "partyEnded")
+    logDebug "Party ends today at ${partyTo.trim()}"
+}
+
+def partyEnded() {
+    log.info "Party over - hand-set lights go back to the automation"
+    clearOverrides("party ended")
+    if (state.presenceActive) evaluateLighting("party ended")
 }
 
 def restoreAfterPlay() {
@@ -2010,7 +2049,8 @@ String adaptiveStatus() {
            "${ramp}; predawn ends ${predawnAt} today; scene now: ${state.currentScene ?: 'off'}; " +
            "cans ${cansDimmable() ? 'dim with the room' : 'on/off'}${((cansFactor ?: 0) as Integer) > 0 ? ' from a ' + cansFactor + '% factor' : ''}; " +
            "manual overrides: ${overrideText()}" +
-           (partyActive() ? "; <b>PARTY MODE</b> (manual settings hold until the room turns off" + (partyEndDate?.trim() ? ", through ${partyEndDate.trim()}" : "") + ")" : "")
+           (partyActive() ? "; <b>PARTY MODE</b> (manual settings hold until the room turns off" + (hhmmMinutes(partyTo) != null ? " or ${partyTo.trim()}" : "") + ")" :
+            partyMode ? "; party mode set for ${partyDate?.trim() ?: 'every day'}${hhmmMinutes(partyFrom) != null && hhmmMinutes(partyTo) != null ? ' ' + partyFrom.trim() + '-' + partyTo.trim() : ''} (not now)" : "")
 }
 
 // ==================== SCENE ACTIONS ====================

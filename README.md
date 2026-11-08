@@ -7,7 +7,7 @@ deployed through the hub's MCP Rule Server (`importUrl`), with `deploy.sh` as th
 
 | File | App | Hub instance |
 |------|-----|--------------|
-| GreatRoomLighting.groovy | Great Room Lighting Controller (v1.52) | app:584 (Apps Code id 529) |
+| GreatRoomLighting.groovy | Great Room Lighting Controller (v1.53) | app:584 (Apps Code id 529) |
 | GoveeHolidayScenes.groovy | Govee Holiday Scenes (v1.11) — scene-by-date for the Govee string lights, deck lights and pathway bulbs | app:590 (Apps Code id 590) |
 | GreatRoomLightingLogger.gs | Google Apps Script webhook for Sheets logging | (Google) |
 | tools/LuxCsvRepair.groovy | One-off utility: rebuilt `lux_clean.csv` on 2026-09-30 (used once, then removed from the hub) | none |
@@ -95,9 +95,9 @@ on for the full 90-minute backstop). A blip restarts the 20 minutes.
 
 ## Great Room: party mode (v1.52)
 
-`partyMode` (with `partyEndDate`, MM-DD): a light somebody set by hand stays that way until the room
+`partyMode` with `partyDate` (MM-DD) and `partyFrom`/`partyTo` (HH:mm): a light somebody set by hand stays that way until the room
 turns off for an empty house; scene changes, mode changes, wind-down, TV time, app restarts, the
-six-hour limit and the three-presses rule leave it alone. First used 2026-11-07/08.
+six-hour limit and the three-presses rule leave it alone; at `partyTo` the hand-set lights go back to the automation. First used 2026-11-08 13:00-18:00.
 
 ## Govee Holiday Scenes (app 590)
 
