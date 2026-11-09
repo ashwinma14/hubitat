@@ -7,7 +7,7 @@ deployed through the hub's MCP Rule Server (`importUrl`), with `deploy.sh` as th
 
 | File | App | Hub instance |
 |------|-----|--------------|
-| GreatRoomLighting.groovy | Great Room Lighting Controller (v1.55) | app:584 (Apps Code id 529) |
+| GreatRoomLighting.groovy | Great Room Lighting Controller (v1.56) | app:584 (Apps Code id 529) |
 | GoveeHolidayScenes.groovy | Govee Holiday Scenes (v1.14) — scene-by-date for the Govee string lights, deck lights and pathway bulbs | app:590 (Apps Code id 590) |
 | GreatRoomLightingLogger.gs | Google Apps Script webhook for Sheets logging | (Google) |
 | tools/LuxCsvRepair.groovy | One-off utility: rebuilt `lux_clean.csv` on 2026-09-30 (used once, then removed from the hub) | none |
@@ -56,6 +56,14 @@ or after 6 h. A press put back where the automation had it counts for nothing; t
 in 30 s is a child and the scene is restored after 20 s; a brighter press during the morning
 ramp is a floor the ramp continues from. The kitchen cans switch (Zooz ZEN71, Advanced
 driver) shows red while under manual control.
+
+The detection compares a light's report with the command the app last sent it, which lives in `state`, and
+Hubitat only saves an execution's state when it ends. The app is therefore `singleThreaded: true` (v1.56): the
+reports queue behind the execution that sent the commands instead of running against the state from before it.
+Without that, on 2026-11-09 08:04 the seven "off" reports of an empty-house turn-off were read as hand presses,
+five lights stayed held off through the next scene, and the living-room color-temperature command (which turns a
+Hue light on) was the only one that got through. Keep executions short: a slow synchronous call would now delay
+every handler behind it (the Sheets webhook is async; the Athom `initialize()` is the one call that can block).
 
 ## Great Room: how the two indoor sensors vote (v1.44)
 

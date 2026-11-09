@@ -6,6 +6,12 @@
  *
  *  Author: Claude (for Ashwin)
  *  Date: 2026-02-12
+ *  Version: 1.56 - single-threaded: the app's executions run one at a time, so a light's report of the command we just
+ *                  sent is handled against the state that recorded the command (2026-11-09 08:04: the house emptied, the
+ *                  room turned off, and the "off" reports were read as hand presses, leaving five lights held off until
+ *                  the next scene change; the only command that got through at 08:23 was the living-room color
+ *                  temperature, which on Hue also turns the light on). The color-temperature command now respects a
+ *                  manual override on the living-room lights as the level command already did.
  *  Version: 1.55 - "lights on" for the kitchen sensor's reading means any of the room's lights, not only the dining
  *                  and cans (the pendant at 100% put the sensor at 54 lux and the app read it as daylight)
  *  Version: 1.54 - party mode: a brightness turn-off leaves hand-set lights alone (only an empty house turns them off),
@@ -97,14 +103,20 @@ definition(
     description: "Unified lighting automation for the great room based on presence, mode, and TV time",
     category: "Lighting",
     iconUrl: "",
-    iconX2Url: ""
+    iconX2Url: "",
+    // One execution at a time. The manual-change detection reads state (turningOff, commanded levels, the last
+    // automation action) that the execution sending the commands only saves when it ends; without this, the lights'
+    // own reports ran their handlers against the state from before the commands (2026-11-09 08:04: the room turned off
+    // for an empty house and its seven "off" reports were taken for hand presses, so the next scene skipped five lights).
+    // Concurrent handlers also overwrote each other's writes to the override and press maps.
+    singleThreaded: true
 )
 
 preferences {
     page(name: "mainPage")
 }
 
-def appVersion() { return "1.55" }
+def appVersion() { return "1.56" }
 
 def mainPage() {
     dynamicPage(name: "mainPage", title: "Great Room Lighting Controller", install: true, uninstall: true) {
@@ -1975,6 +1987,17 @@ def setLevelSmooth(dev, Number level, Number seconds) {
     }
 }
 
+/**
+ * The scene's color temperature for the living-room ceiling. On Hue a color-temperature command also switches the light
+ * on, so it has to respect a manual override the way setLevelSmooth does: on 2026-11-09 08:23 it was the one command that
+ * reached a room full of (wrongly) held lights and lit the living room on its own.
+ */
+void lrColorTemperature(Integer kelvin) {
+    if (!lrHueLights?.hasCommand("setColorTemperature")) return
+    if (overridden(lrHueLights)) { logDebug "LR Lights: manual override - color temperature left alone"; return }
+    lrHueLights.setColorTemperature(kelvin)
+}
+
 /** Re-apply the current day/night scene when the ambient band changes while the room is on. */
 def ambientStep(String reason) {
     if (adaptiveEnabled == false || appPaused) return
@@ -2104,11 +2127,7 @@ def applyDayScene(Number fadeOverride = null) {
     setLevelSmooth(bookcaseColorLamp, scaled(dayBookcaseLevel ?: 50), fade)
     setLevelSmooth(lrHueLights, lrLevel, fade)
     state.lrDimmed = !lrOccupied
-    
-    // Set color temp if supported (warm white)
-    if (lrHueLights?.hasCommand("setColorTemperature")) {
-        lrHueLights.setColorTemperature(2700)
-    }
+    lrColorTemperature(2700)   // warm white
     
     activatorSwitch?.on()
     state.currentScene = "day"
@@ -2158,11 +2177,7 @@ def applyNightScene(Number fadeOverride = null) {
     setLevelSmooth(bookcaseColorLamp, scaled(nightBookcaseLevel ?: 15), fade)
     setLevelSmooth(lrHueLights, lrLevel, fade)
     state.lrDimmed = !lrOccupied
-    
-    // Set color temp if supported (warm white)
-    if (lrHueLights?.hasCommand("setColorTemperature")) {
-        lrHueLights.setColorTemperature(2700)
-    }
+    lrColorTemperature(2700)   // warm white
     
     activatorSwitch?.on()
     state.currentScene = "night"
@@ -2196,10 +2211,7 @@ def applyPredawnScene() {
     state.currentScene = "predawn"
     state.kzDimmed = false
 
-    // Extra warm color temp for early morning
-    if (lrHueLights?.hasCommand("setColorTemperature")) {
-        lrHueLights.setColorTemperature(2200)
-    }
+    lrColorTemperature(2200)   // extra warm for the early morning
 
     activatorSwitch?.on()
 
@@ -2230,10 +2242,7 @@ def applyWindDownScene() {
     state.currentScene = "winddown"
     state.kzDimmed = false
 
-    // Warm color temp for the late evening
-    if (lrHueLights?.hasCommand("setColorTemperature")) {
-        lrHueLights.setColorTemperature(2400)
-    }
+    lrColorTemperature(2400)   // warm for the late evening
 
     activatorSwitch?.on()
 
