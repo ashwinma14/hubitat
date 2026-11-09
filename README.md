@@ -105,7 +105,8 @@ on for the full 90-minute backstop). A blip restarts the 20 minutes.
 
 `partyMode` with `partyDate` (MM-DD) and `partyFrom`/`partyTo` (HH:mm): a light somebody set by hand stays that way until the room
 turns off for an empty house; scene changes, mode changes, wind-down, TV time, app restarts, the
-six-hour limit and the three-presses rule leave it alone; at `partyTo` the hand-set lights go back to the automation. First used 2026-11-08 13:00-18:00.
+six-hour limit and the three-presses rule leave it alone; at `partyTo` the hand-set lights go back to the automation. First used 2026-11-08 13:00-18:00;
+switched off again on 2026-11-09 (`partyDate` is MM-DD, so a party mode left on would return on the same day next year).
 
 ## Govee Holiday Scenes (app 590)
 
@@ -119,8 +120,19 @@ driver reports `cloudAPI=Success`). A two-color spec such as `alt:#8B00FF/#FF550
 deck lights and paints a single bulb one color (436 = first color, 437 = second).
 Game days override everything with the Seahawks colors the same way.
 Since v1.11 `earlyOnDates` (MM-DD list) + `earlyOnTime` switch the plugs on at that time on those
-days instead of waiting for dusk; Room Lighting ignores its lux turn-off while it did not activate the
-lights itself, and still turns them off in the morning. First used 2026-11-07/08 at 15:00.
+days instead of waiting for dusk. First used 2026-11-07/08 at 15:00; the dates were blanked on 2026-11-09
+(they are MM-DD and would fire again a year later).
+
+The early power-on leans on the hub's Room Lighting instance "Outdoor Lights" (app 418: plugs 394, 395, 396, 397
+and a dual plug, 315/316, whose outlets have not reported since December 2024; on below 400 lux, off above 500). That app acts on
+its own state, not the plugs': while it believes the lights are off it logs "Already Turned Off" for every
+reading above 500 and leaves switched-on plugs alone, it takes them over at its next activation (below 400), and
+only then does its morning turn-off apply to them. On 2026-11-07 it activated at 15:17 (17 minutes after the
+early power-on) and was then **paused** some time before Sunday morning's first reading above 500 (in the Hubitat
+UI: the MCP connection keeps a rollback baseline for every app it edits and had none for 418), so nothing turned the
+plugs off until 2026-11-09 14:42, almost 48 hours. A paused instance shows as "Outdoor Lights (Paused)" in the apps list
+and in the `triggered` list of any plug or lux event; neither app here can see or undo it. When outdoor lights
+are on in daylight, look there first, resume it, then press its Turn Off (or Activate) so its state matches the plugs.
 Since v1.9 a window's scene text may hold per-light rules separated by `;`: `Light name = alternatives`
 (label or device id; `*` or a bare rule is the fallback; lights with no rule keep the default scene).
 `off` switches a light off (it is switched back on when its next look arrives), `default` means the
@@ -131,7 +143,8 @@ the `ct:` look first paints every segment with the temperature's RGB: segment co
 color-temperature command on the RGBIC deck lights (they kept the game colors through a week of accepted
 2700 K commands, 2026-11-02 to 11-07). Default since 2026-11-01:
 `GH-ILZ04Q | ct:2700` (the bulb strings keep their DIY, deck and pathway bulbs warm white). Diwali 2026 (custom window 1, 11-01 to 11-08):
-`LED Bulb String Lights = Pastel; Front String Lights = off`.
+`LED Bulb String Lights = Pastel; Front String Lights = Pastel; Smart LED Bulb = alt:#FFB3C6/#C8A2FF; Smart LED Bulb 2 = alt:#FFB3C6/#C8A2FF`
+(deck lights keep the default). The window is MM-DD and repeats every year, and Diwali moves: give it new dates before November 2027.
 
 ## Motion Logger (Rule Machine rule 544)
 
