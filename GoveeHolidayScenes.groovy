@@ -15,6 +15,12 @@
  *
  *  Author: Claude (for Ashwin)
  *  Date: 2026-09-29
+ *  Version: 1.15 - audit pass (2026-11-09): automatic sends (plug power-on, game window, date rollover) leave the
+ *                  sunset-timer lights out while it is daylight, as the notes always said they did; every afternoon
+ *                  power-on had been sending to the unpowered pathway bulbs four times and logging four "NOT confirmed"
+ *                  warnings. The sunset burst and the re-send loop still bring them in, and "Apply scene now" still
+ *                  sends to everything. An app update no longer fires a re-send 30 s later regardless of sunset.
+ *                  Removed the leftover gameBulbCount setting (per-light counts replaced it in v1.3)
  *  Version: 1.14 - sunset (and the Apply button) restart the self-powered re-send budget: on a dark day the plugs never
  *                  cycle and the six hours were spent before the timer bulbs had power
  *  Version: 1.13 - a 'ct:' look on a light with per-segment control paints every segment with the temperature's RGB
@@ -67,7 +73,7 @@ preferences {
     page(name: "mainPage")
 }
 
-def appVersion() { return "1.14" }
+def appVersion() { return "1.15" }
 
 def mainPage() {
     dynamicPage(name: "mainPage", title: "Govee Holiday Scenes v${appVersion()}", install: true, uninstall: true) {
@@ -217,11 +223,17 @@ def initialize() {
         }
     }
 
-    // Resume the self-powered re-send loop if the lights are on right now (a code update mid-evening must not drop it)
+    // Resume the self-powered re-send loop if the lights are on right now (a code update mid-evening must not drop it);
+    // armSelfRetry waits for sunset when the timer lights have no power yet
     if (state.confirmedLooks == null) state.confirmedLooks = [:]
     if (selfPoweredLights() && anyPowerOn()) {
         state.retryStartedAt = now()
-        runIn(30, "retrySelfPowered")
+        armSelfRetry()
+    }
+    // gameBulbCount was the one bulb count for every light until v1.3 gave each light its own
+    if (settings["gameBulbCount"] != null) {
+        try { app.removeSetting("gameBulbCount"); log.info "Removed retired setting 'gameBulbCount'" }
+        catch (e) { log.warn "Could not remove retired setting 'gameBulbCount': ${e.message}" }
     }
 
     def selfPowered = selfPoweredLights()
@@ -360,6 +372,9 @@ def applyScenes(data) {
     def attempt = data?.attempt ?: 1
     List only = data?.devices ? data.devices.collect { it.toString() } : null
     def lights = only ? goveeLights.findAll { it.id.toString() in only } : goveeLights
+    // Timer lights have no power in daylight: an automatic send leaves them to the sunset burst (the Apply button does not)
+    def waiting = (only || reason == "manual") ? [] : lights.findAll { waitingForSunset(it) }
+    if (waiting) lights = lights.findAll { l -> !waiting.any { it.id == l.id } }
     boolean game = gameActive() && gamePattern in ["alternate", "auto"]
     String target = targetSceneName()
     def sent = []
@@ -376,7 +391,8 @@ def applyScenes(data) {
     }
 
     state.lastApplied = [scene: target, at: now(), reason: reason, attempt: attempt, devices: sent]
-    log.info "${game ? 'Game-day look' : 'Scene'} '${target}' sent (${reason}, attempt ${attempt}${only ? ', ' + lights.size() + ' light(s)' : ''}): ${sent.join(', ') ?: 'none'}"
+    log.info "${game ? 'Game-day look' : 'Scene'} '${target}' sent (${reason}, attempt ${attempt}${only ? ', ' + lights.size() + ' light(s)' : ''}): ${sent.join(', ') ?: 'none'}" +
+             (waiting ? "; left for sunset: ${waiting*.displayName.join(', ')}" : "")
     if (missing) {
         log.warn "'${target}' cannot be shown by: ${missing.join(', ')} (scene not in its catalog: use 'Reload scene catalogs', or check the name)"
     }
@@ -908,6 +924,27 @@ def sunsetHandler(evt) {
 
 def sunsetSend() {
     retrySelfPowered()
+}
+
+/**
+ * A self-powered light on a sunset timer has no power in daylight, so between sunrise and its first sunset send an
+ * automatic send would only fail ("device offline") and warn. Compared by time of day, so it does not matter whether
+ * the hub's sunrise and sunset already belong to tomorrow.
+ */
+boolean waitingForSunset(dev) {
+    if (selfSunset == false || !settings["selfPowered_${dev.id}".toString()]) return false
+    long sunset = sunsetMillis()
+    long sunrise = 0L
+    try { sunrise = location.sunrise?.time ?: 0L } catch (e) { sunrise = 0L }
+    if (!sunset || !sunrise) return false
+    int nowM = minuteOfDay(now())
+    return nowM >= minuteOfDay(sunrise) && nowM < minuteOfDay(sunset) + Math.max(0, (selfSunsetOffset ?: 1) as Integer)
+}
+
+int minuteOfDay(long millis) {
+    Calendar c = Calendar.getInstance(location.timeZone)
+    c.setTimeInMillis(millis)
+    return c.get(Calendar.HOUR_OF_DAY) * 60 + c.get(Calendar.MINUTE)
 }
 
 /** Earliest moment a self-powered re-send makes sense today: sunset + offset on a sunset timer, otherwise now. */
