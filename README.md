@@ -7,8 +7,9 @@ deployed through the hub's MCP Rule Server (`importUrl`), with `deploy.sh` as th
 
 | File | App | Hub instance |
 |------|-----|--------------|
-| GreatRoomLighting.groovy | Great Room Lighting Controller (v1.56) | app:584 (Apps Code id 529) |
-| GoveeHolidayScenes.groovy | Govee Holiday Scenes (v1.14) — scene-by-date for the Govee string lights, deck lights and pathway bulbs | app:590 (Apps Code id 590) |
+| GreatRoomLighting.groovy | Great Room Lighting Controller (v1.57) | app:584 (Apps Code id 529) |
+| GoveeHolidayScenes.groovy | Govee Holiday Scenes (v1.15) — scene-by-date for the Govee string lights, deck lights and pathway bulbs | app:590 (Apps Code id 590) |
+| GarageDoorBlink.groovy | Garage Door Blink (v2.1) — blinks the kitchen pendant through the Hue bridge's on/off signal when the garage door opens | app:597 (Apps Code id 595) |
 | GreatRoomLightingLogger.gs | Google Apps Script webhook for Sheets logging | (Google) |
 | tools/LuxCsvRepair.groovy | One-off utility: rebuilt `lux_clean.csv` on 2026-09-30 (used once, then removed from the hub) | none |
 
@@ -24,11 +25,10 @@ the untouched original is `lux_clean_raw_backup_20260930.csv` on the hub.
 ## Workflow
 
 1. Edit the .groovy file (usually via Claude from phone/desktop).
-2. Commit and push, then deploy via MCP (below); `./deploy.sh` is the LAN fallback.
-3. If the change touched subscriptions or inputs: open the app in
-   Apps → Great Room Lighting and click **Done** to re-initialize.
-   Pure logic changes take effect immediately.
-4. Commit: `git add -A && git commit -m "..."`.
+2. Commit and push, then deploy via MCP (below). `./deploy.sh <file>` is the LAN fallback; it takes each
+   file's Apps Code id from `deploy.conf` and refuses an id whose code on the hub is a different app.
+3. If the change touched subscriptions, inputs or anything `initialize()` does: press **Done** on the app
+   (in the UI, or over MCP as below). Pure logic changes take effect immediately.
 
 ## Deploy via MCP (preferred)
 
@@ -45,7 +45,10 @@ Hubitat connector:
 4. Verify: `hub_get_source` shows `version+1` and `totalLength` equal to the file's
    byte count (the source is ASCII, so chars == bytes), and the FNV-1a of the hub
    source equals the git file's (e.g. from the hub's `/app/ajax/code?id=529`).
-5. If the change touched subscriptions or inputs, open the app and click **Done**.
+5. If the change touched subscriptions, inputs or `initialize()`: `hub_manage_native_rules_and_apps →
+   hub_set_native_app` with the instance id and one setting written back at its current value
+   (e.g. `{"lrMmwaveEmptyMinutes": 20}` on 584) presses **Done**. Empty settings are rejected. A Done press drops
+   every manual hold and re-applies the scene, so pick a moment when nobody has set a light by hand.
 
 ## Great Room: manual changes (v1.41-1.42)
 
@@ -54,8 +57,9 @@ that one light out of the automation; the rest of the room carries on. It comes 
 next scene change (predawn end, wind-down, mode change, TV time, everyone leaving, room off)
 or after 6 h. A press put back where the automation had it counts for nothing; three presses
 in 30 s is a child and the scene is restored after 20 s; a brighter press during the morning
-ramp is a floor the ramp continues from. The kitchen cans switch (Zooz ZEN71, Advanced
-driver) shows red while under manual control.
+ramp is a floor the ramp continues from. The red switch LED that used to mark a manual hold
+went away with the ZEN71: the cans dimmer is a ZEN77 on the built-in driver, which has no LED
+commands, so the three LED settings currently do nothing.
 
 The detection compares a light's report with the command the app last sent it, which lives in `state`, and
 Hubitat only saves an execution's state when it ends. The app is therefore `singleThreaded: true` (v1.56): the
@@ -114,7 +118,9 @@ Lights: string lights 433 (H7021, 96 ft, 30 bulbs), deck lights 434 (H7067, 15),
 Lights 441 (H702C, 144 ft, 45 bulbs, added 2026-10-26), all powered by the Twinkle/Front Lights
 plugs; the per-light bulb count must match the Govee API's segment range (the alternate pattern
 paints segments 0..count-1), and pathway bulbs 436 and 437 (Govee H600A on a non-smart sunset timer: no plug event, so they
-are marked "self-powered": nothing is sent before the hub's sunset, a burst goes out at
+are marked "self-powered": nothing is sent between sunrise and the hub's sunset (true of every automatic
+send only since v1.15; until then each afternoon power-on sent to the unpowered bulbs four times and logged four
+warnings; the Apply button still sends to everything), a burst goes out at
 sunset +1/+3/+6 min, and they are re-sent every 5 min while the plugs are on until the
 driver reports `cloudAPI=Success`). A two-color spec such as `alt:#8B00FF/#FF5500` alternates bulbs on the
 deck lights and paints a single bulb one color (436 = first color, 437 = second).
@@ -156,14 +162,47 @@ values) to `motion.csv`. Fixed the same way on 2026-09-30; raw original kept as
 
 `archive/` holds code that used to run on the hub and was retired (kept for reference only):
 `AmbientTierClassifier.groovy` (Apps Code 526, superseded by the adaptive logic in
-Great Room Lighting v1.31).
+Great Room Lighting v1.31; the code is still installed on the hub, with no instance) and
+`GreatRoomLighting_hub_v22.groovy` (the Great Room app as it ran before this repo existed: hub
+version 22, app v1.26).
 
 ## Gotchas
 
-- `APP_CODE_ID` in deploy.conf is the **Apps Code editor id**
-  (http://HUB/app/editor/ID), not the installed instance id (app:584).
+- The ids in deploy.conf (`APP_IDS`) are **Apps Code editor ids**
+  (http://HUB/app/editor/ID), not the installed instance ids (app:584).
 - If the hub has login security enabled, deploy.sh needs a session cookie
   step added (currently assumes open LAN access).
-- The Athom presence sensor (device 364, 192.168.86.227) periodically floods
-  illuminance events and gets throttled by the hub
-  (LimitExceededException) — see project notes.
+- The Athom presence sensor (device 364, 192.168.86.227) reports illuminance every few seconds
+  (it flips between two neighbouring values) and was throttled by the hub for it in the past
+  (LimitExceededException). No throttling in the hub log on 2026-11-09, but it is still the
+  chattiest device on the hub; raising its illuminance reporting interval in ESPHome would end it.
+- Hub modes: Mode Manager sets Day when outdoor lux rises above 300 and Night when it falls below 200;
+  Rule Machine rule 565 sets Night whenever the TV Time switch (419) turns off. Nothing sets Evening,
+  Away or Early Morning, so the Great Room app's Evening branches never run.
+- Hubitat saves an app's `state` when an execution ends. An app that compares events with what it
+  just wrote to `state` needs `singleThreaded: true` (all three apps here have it).
+
+## Audit 2026-11-09
+
+Fixed that day (Great Room v1.57, Govee v1.15, Garage Door Blink v2.1, deploy.sh): see the version notes at the top
+of each file. Settings the code stopped reading long ago were removed from the installed apps; their last values, in
+case one is ever wanted again: Great Room `cansLuxThreshold` 150, `chromecast` device 423 (Foyer TV),
+`chromecastIdleDelay` 300, `chromecastPlayDelay` 120, `partyEndDate` 11-08; Govee `gameBulbCount` 15.
+
+Left alone, waiting for a decision:
+
+- An off press on a wall switch holds that light off until the next scene change or 6 h. Asked for: have it come
+  back sooner (on the next kitchen-zone entry, or a shorter limit for off presses).
+- With the scene off, the app still judges "is the room lit" by any light being on: a lamp switched on by hand in a
+  room it considers bright is switched off 10-20 minutes later, and a hand-lit lamp at a 40-99 lux kitchen reading
+  brings the whole room on after the 10-minute debounce.
+- Sheets logging is off (`webhookUrl` is blank and no `luxSensor` is selected): the 34 `safeLogToSheet` calls,
+  the `luxSensor` input and `GreatRoomLightingLogger.gs` (which also drops a lux of 0) do nothing.
+- The cloud-cover rule (weather device 424) can only matter in Day mode with 70%+ cloud and outdoor lux between
+  about 200 and 700; the indoor sensors already cover a dull room.
+- The three switch-LED settings do nothing (see "manual changes").
+- The hallway dimmer (128) cannot fade: its firmware rejects a duration and its driver logs a warning on every
+  timed command.
+- `lux_clean.csv` (4.0 MB) and `motion.csv` (2.8 MB) grow without limit and every append rewrites the file.
+- Room Lighting "Outdoor Lights" (418) still lists the dual plug 315/316, silent since December 2024.
+
