@@ -207,3 +207,17 @@ Left alone, waiting for a decision:
 - `lux_clean.csv` (4.0 MB) and `motion.csv` (2.8 MB) grow without limit and every append rewrites the file.
 - Room Lighting "Outdoor Lights" (418) still lists the dual plug 315/316, silent since December 2024.
 
+Hub leftovers found in the same pass (none of them this repo's code):
+
+- Motion Lighting "Downstairs Motion (accent light)" (27) still switches Kitchen Cabinet Lights (42) on and off
+  several times a day; the light has not answered since November 2025.
+- Rule Machine "Google Sheets" (336) sends a GET to a Google Form on every outdoor temperature or lux change with
+  two variables that are never set (both 0); "Light" (447) has no triggers and no actions.
+- Rachio Community (446) throws a `heartbeat()` MissingMethodException every 15 minutes; Living Room Harmony Hub
+  (323) retries an unreachable host every 10 minutes.
+- Paused: Room Lighting "Garage Lights" (126), Rule Machine "Office Lights Failsafe (2h no motion)" (596).
+- "Kitchen Cans (old)" (439, the retired ZEN71), the group "Kitchen (All)" (127), about 20 Apps Code entries with
+  no installed instance, and File Manager files from 2022-2024 (HubiGraph, WeatherTile, webcore, `lux.csv`), the two
+  raw CSV backups of 2026-09-30 (3.7 MB) and `mcp_nl_test_backup_20260930-081839.txt`.
+- Hub firmware 2.5.2.139 is available (running 2.5.2.128); Hubitat Package Manager shows updates.
+
