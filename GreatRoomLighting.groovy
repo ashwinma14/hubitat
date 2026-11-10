@@ -6,6 +6,13 @@
  *
  *  Author: Claude (for Ashwin)
  *  Date: 2026-02-12
+ *  Version: 1.57 - audit pass (2026-11-09): one function says which scene the mode and the clock call for (the restart
+ *                  path, the scene change and the living-room zone level each had their own copy, and the restart copy
+ *                  sent Evening mode to the day scene); TV time survives an app update (the flag was reset while the
+ *                  switch stayed on); a reading that falls back under the daylight level on a lit room cancels the
+ *                  turn-off and nothing else (it used to log "confirming before turning on" and re-apply the scene ten
+ *                  minutes later); removed the refresh()-on-every-motion path (no sensor here has that command), an
+ *                  unused function, an unused state flag and five settings of inputs that no longer exist
  *  Version: 1.56 - single-threaded: the app's executions run one at a time, so a light's report of the command we just
  *                  sent is handled against the state that recorded the command (2026-11-09 08:04: the house emptied, the
  *                  room turned off, and the "off" reports were read as hand presses, leaving five lights held off until
@@ -116,7 +123,7 @@ preferences {
     page(name: "mainPage")
 }
 
-def appVersion() { return "1.56" }
+def appVersion() { return "1.57" }
 
 def mainPage() {
     dynamicPage(name: "mainPage", title: "Great Room Lighting Controller", install: true, uninstall: true) {
@@ -131,7 +138,7 @@ def mainPage() {
             input "exitDoors", "capability.contactSensor", title: "Exit doors (the front door): opening after the living room last moved means somebody left it", required: false, multiple: true
             input "indoorLuxSensor", "capability.illuminanceMeasurement", title: "Indoor Lux Sensor (for dark room detection)", required: false
             input "indoorLuxSensor2", "capability.illuminanceMeasurement", title: "Second indoor lux sensor (true-lux sensor such as the kitchen Hue motion sensor; the room counts as dark when EITHER sensor says so)", required: false
-            input "outdoorLuxSensor", "capability.illuminanceMeasurement", title: "Outdoor Lux Sensor (for cloudy day check)", required: false
+            input "outdoorLuxSensor", "capability.illuminanceMeasurement", title: "Outdoor Lux Sensor (adaptive brightness, daytime debounce, cloudy day check)", required: false
             input "weatherDevice", "capability.relativeHumidityMeasurement", title: "Weather Device (for cloud cover)", required: false, description: "OpenWeatherMap device with cloudiness attribute"
             input "luxSensor", "capability.illuminanceMeasurement", title: "Lux Sensor (for logging only)", required: false
             input "diningSwitch", "capability.switch", title: "Dining Switch", required: true
@@ -364,7 +371,7 @@ def initialize() {
         subscribe(weatherDevice, "cloudiness", cloudHandler)
     }
     
-    // Subscribe to outdoor lux for ambient-based dining level
+    // Subscribe to outdoor lux: it drives the adaptive brightness bands
     if (outdoorLuxSensor) {
         subscribe(outdoorLuxSensor, "illuminance", outdoorLuxHandler)
     }
@@ -389,11 +396,13 @@ def initialize() {
     }
     state.presses = [:]
     state.rampFloor = state.morningRamp ? (state.rampFloor ?: [:]) : null
+    removeRetiredSettings()
     
     // Initialize state
     state.presenceActive = (motionZone.currentMotion == "active")
     clearOverrides("app restarted")   // also puts the switch LEDs back
-    state.tvTimeActive = false
+    // TV time survives an app update: the switch is the truth, not a flag every restart used to wipe
+    state.tvTimeActive = (tvTimeSwitch?.currentSwitch == "on")
     state.lastAutomationAction = now()
     state.pendingPresenceOff = false
     state.pendingBrightOff = false
@@ -468,11 +477,7 @@ def delayedInitialEvaluation() {
     // If conditions say lights should be ON, turn them on
     if (state.presenceActive && state.lightNeeded && !state.tvTimeActive) {
         log.info "Conditions warrant lights on - applying scene"
-        if (location.mode == "Night") {
-            if (isPredawn()) { applyPredawnScene() } else if (isWindDown()) { applyWindDownScene() } else if (isMorning()) { applyDayScene() } else { applyNightScene() }
-        } else {
-            applyDayScene()
-        }
+        applySceneForNow()
     } else if (roomIsOn() && !state.presenceActive && !state.tvTimeActive) {
         // The zone is already quiet and the room is lit: the update cancelled the running presence timeout, so restart it
         // (otherwise the room stays lit until the next motion event, 2026-10-06)
@@ -616,9 +621,21 @@ String indoorReadings() {
     return a + b
 }
 
-def isLightNeededForMode(String mode) {
-    // Legacy method - just checks mode
-    return (mode == "Night" || mode == "Evening")
+/**
+ * Settings left behind by inputs that no longer exist (v1.2x chromecast TV detection, the lux-gated cans, the first
+ * party-mode end date). The chromecast one still held a device reference. Removing them changes nothing the code reads.
+ */
+void removeRetiredSettings() {
+    ["cansLuxThreshold", "chromecast", "chromecastIdleDelay", "chromecastPlayDelay", "partyEndDate"].each { String old ->
+        if (settings[old] == null) return
+        try {
+            app.removeSetting(old)
+            log.info "Removed retired setting '${old}'"
+        } catch (e) {
+            log.warn "Could not remove retired setting '${old}': ${e.message}"
+        }
+    }
+    state.remove("manualOverride")   // written since v1.41, never read
 }
 
 def getDiningLevelForAmbient() {
@@ -899,39 +916,11 @@ void zoneActive() {
     def wasAlreadyPresent = state.presenceActive
     state.presenceActive = true
 
+    // Someone arrived: decide the lighting. While they stay, the lux, mode and schedule handlers keep it current (the
+    // sensors report by themselves; the old refresh()-on-every-motion path needed a command no sensor here has)
     if (!wasAlreadyPresent) {
         logDebug "Presence detected - someone is here"
-    }
-
-    // Refresh indoor lux sensor on EVERY motion active event (not just first)
-    // This catches gradual darkening while someone is already present
-    if (indoorLuxSensor?.hasCommand("refresh")) {
-        logDebug "Refreshing indoor lux sensor..."
-        indoorLuxSensor.refresh()
-        // Wait 2 seconds for sensor to update, then evaluate
-        runIn(2, evaluateLightingAfterRefresh)
-    } else if (!wasAlreadyPresent) {
-        // Only evaluate on first presence if no indoor sensor
         evaluateLighting("presence activated")
-    }
-}
-
-def evaluateLightingAfterRefresh() {
-    def indoorLux = indoorLuxSensor?.currentIlluminance ?: 999
-    logDebug "Indoor lux after refresh: ${indoorLux}"
-    
-    // Only evaluate if lights might need to change
-    def lightsCurrentlyOn = (diningSwitch?.currentSwitch == "on" || kitchenCans?.currentSwitch == "on")
-    def lightNeeded = isLightNeeded()
-    
-    if (!lightsCurrentlyOn && lightNeeded && !state.tvTimeActive) {
-        // Lights are off but should be on
-        evaluateLighting("motion + indoor lux ${indoorLux}")
-    } else if (lightsCurrentlyOn && !lightNeeded && !state.tvTimeActive) {
-        // Lights are on but shouldn't be (unlikely but handle it)
-        evaluateLighting("motion + indoor lux ${indoorLux} (too bright)")
-    } else {
-        logDebug "No lighting change needed (lights=${lightsCurrentlyOn ? 'on' : 'off'}, needed=${lightNeeded})"
     }
 }
 
@@ -1014,10 +1003,15 @@ def indoorLuxHandler(evt) {
         
         if (wasLightNeeded != state.lightNeeded) {
             if (state.lightNeeded) {
-                // Got darker - turn on immediately, cancel any pending off
+                // Got darker - cancel any pending off
                 unschedule(turnOffDueToBright)
                 state.pendingBrightOff = false
-                if (daytimeDebounceApplies()) {
+                if (sceneIsLit()) {
+                    // A scene is already up: the reading only came back under the daylight level while the turn-off
+                    // countdown ran, so there is nothing to turn on (2026-11-09 13:50: this logged "confirming for 10
+                    // minutes before turning on" and re-applied the scene at 14:00 on a room that had never gone off)
+                    log.info "Indoor readings back under the daylight level (${indoorReadings()}) - the lights stay on"
+                } else if (daytimeDebounceApplies()) {
                     // Bright outside, dim inside: make the condition hold before lighting the whole room in daylight.
                     // A passing cloud at midday gets the long debounce; real dusk (outdoor already under duskLuxThreshold) the short one.
                     Integer mins = darkRoomDebounceMinutes()
@@ -1423,8 +1417,8 @@ def applyLrDimmed() {
 
 def applyLrZoneLevel(Boolean occupied) {
     // Zone dimming touches ONLY the LR ceiling - other lights keep their scene levels
-    def isNightish = (location.mode == "Night" || location.mode == "Evening") && !(location.mode == "Night" && isMorning() && !isPredawn())
-    def fullLevel = isNightish ? (isPredawn() ? (predawnHueLevel ?: 30) : (isWindDown() ? (windDownHueLevel ?: 50) : (nightHueLevel ?: 80))) : (dayHueLevel ?: 100)
+    String kind = sceneForNow()
+    def fullLevel = kind == "predawn" ? (predawnHueLevel ?: 30) : kind == "winddown" ? (windDownHueLevel ?: 50) : kind == "night" ? (nightHueLevel ?: 80) : (dayHueLevel ?: 100)
     def lrLevel = scaled(occupied ? fullLevel : ((fullLevel * 50 / 100) as Integer))
     if (occupied) {
         state.lastLrBrightenTime = now()
@@ -1635,7 +1629,6 @@ void addOverride(dev) {
     Integer mins = (manualOverrideMinutes ?: 360) as Integer
     o[dev.id.toString()] = mins > 0 ? now() + mins * 60000L : 4102444800000L
     state.overrides = o
-    state.manualOverride = true
     if (fresh) showOverrideLed(dev, true)
 }
 
@@ -1644,7 +1637,6 @@ void dropOverride(dev) {
     Map o = (state.overrides ?: [:]) as Map
     if (o.remove(dev.id.toString()) != null) {
         state.overrides = o
-        state.manualOverride = !o.isEmpty()
         showOverrideLed(dev, false)
     }
 }
@@ -1674,7 +1666,6 @@ void clearOverrides(String reason) {
         overrideDevices().each { showOverrideLed(it, false) }
     }
     state.overrides = [:]
-    state.manualOverride = false
 }
 
 List overrideDevices() {
@@ -1766,33 +1757,38 @@ def evaluateLighting(String reason) {
     // We need lights - cancel any pending off
     unschedule(turnAllLightsOff)
     
-    // Apply scene based on mode
+    logDebug "Mode ${location.mode} - applying the ${sceneForNow()} scene"
+    applySceneForNow()
+}
+
+/**
+ * Which scene the mode and the clock call for. Night mode: predawn until the predawn end, then the day scene's levels
+ * until noon (Night lasts until the outdoor sensor reads 300 lux, which is mid-morning in winter), wind-down from its
+ * start time, the night scene otherwise. Evening mode: wind-down or night. Any other mode: day.
+ * One place, so an app restart, a scene change and the living-room zone level cannot disagree.
+ */
+String sceneForNow() {
     if (location.mode == "Night") {
-        if (isPredawn()) {
-            logDebug "Night mode (predawn) - applying predawn scene"
-            applyPredawnScene()
-        } else if (isWindDown()) {
-            logDebug "Night mode (wind-down) - applying wind-down scene"
-            applyWindDownScene()
-        } else if (isMorning()) {
-            logDebug "Night mode (morning) - applying day scene"
-            applyDayScene()
-        } else {
-            logDebug "Night mode - applying night scene"
-            applyNightScene()
-        }
-    } else if (location.mode == "Evening") {
-        if (isWindDown()) {
-            logDebug "Evening mode (wind-down) - applying wind-down scene"
-            applyWindDownScene()
-        } else {
-            logDebug "Evening mode - applying night scene"
-            applyNightScene()
-        }
-    } else {
-        logDebug "Other mode (${location.mode}) - applying day scene"
-        applyDayScene()
+        if (isPredawn()) return "predawn"
+        if (isWindDown()) return "winddown"
+        return isMorning() ? "day" : "night"
     }
+    if (location.mode == "Evening") return isWindDown() ? "winddown" : "night"
+    return "day"
+}
+
+void applySceneForNow() {
+    switch (sceneForNow()) {
+        case "predawn": applyPredawnScene(); break
+        case "winddown": applyWindDownScene(); break
+        case "night": applyNightScene(); break
+        default: applyDayScene()
+    }
+}
+
+/** The automation has a scene up, as opposed to a lamp somebody switched on by hand in a room that is off. */
+boolean sceneIsLit() {
+    return (state.currentScene ?: "off") != "off" && roomIsOn()
 }
 
 // ==================== ADAPTIVE BRIGHTNESS ====================
@@ -2101,7 +2097,8 @@ def applyDayScene(Number fadeOverride = null) {
     
     // Check if living room is occupied (default to true if sensor not configured)
     def lrOccupied = livingRoomOccupied()
-    Integer lrLevel = floored(lrHueLights, scaled(lrOccupied ? (dayHueLevel ?: 100) : 50))
+    def lrFull = dayHueLevel ?: 100
+    Integer lrLevel = floored(lrHueLights, scaled(lrOccupied ? lrFull : ((lrFull * 50 / 100) as Integer)))
     Integer hallwayLevel = floored(hallwaySwitch, scaled(dayHallwayLevel ?: 99))
     Integer pendantLevel = floored(kitchenPendant, scaled(dayKitchenPendantLevel ?: 100))
 
@@ -2199,7 +2196,7 @@ def applyPredawnScene() {
         state.lastLrBrightenTime = now()
     }
 
-    // Gentle wake: low warm light only - dining Edisons and kitchen cans stay off
+    // Gentle wake: low warm light only - the dining Edisons stay off, the cans follow their predawn level (0 = off)
     Integer fade = sceneFade(null)
     if (!overridden(diningSwitch)) diningSwitch?.off()
     setLevelSmooth(hallwaySwitch, predawnHallwayLevel ?: 20, fade)
