@@ -14,6 +14,9 @@
  * are toggled on/off and restored afterwards; don't use that fallback on lights another automation
  * watches for manual changes.
  *
+ * v2.1  2026-11-09  singleThreaded: the two bridge lookups (lights, groups) answer at the same moment and each
+ *                   saved its own copy of the id map, so one could erase the other's result and that light fell
+ *                   back to the soft blink; it also keeps two door reports in the same instant to one blink.
  * v2.0  2026-10-19  Hue V2 "on_off" signaling (real off/on blink, state preserved) with bridge pairing
  *                   and automatic V1->V2 id resolution; flashOnce kept as the fallback.
  * v1.0  2026-10-15  First version: trigger on door opening/open or contact open, Hue alert blinks,
@@ -22,7 +25,7 @@
 
 import groovy.transform.Field
 
-@Field static final String APP_VERSION = "2.0"
+@Field static final String APP_VERSION = "2.1"
 
 definition(
     name: "Garage Door Blink",
@@ -32,7 +35,8 @@ definition(
     category: "Convenience",
     iconUrl: "",
     iconX2Url: "",
-    singleInstance: false
+    singleInstance: false,
+    singleThreaded: true
 )
 
 preferences {
