@@ -7,7 +7,7 @@ deployed through the hub's MCP Rule Server (`importUrl`), with `deploy.sh` as th
 
 | File | App | Hub instance |
 |------|-----|--------------|
-| GreatRoomLighting.groovy | Great Room Lighting Controller (v1.57) | app:584 (Apps Code id 529) |
+| GreatRoomLighting.groovy | Great Room Lighting Controller (v1.58) | app:584 (Apps Code id 529) |
 | GoveeHolidayScenes.groovy | Govee Holiday Scenes (v1.15) — scene-by-date for the Govee string lights, deck lights and pathway bulbs | app:590 (Apps Code id 590) |
 | GarageDoorBlink.groovy | Garage Door Blink (v2.1) — blinks the kitchen pendant through the Hue bridge's on/off signal when the garage door opens | app:597 (Apps Code id 595) |
 | GreatRoomLightingLogger.gs | Google Apps Script webhook for Sheets logging | (Google) |
@@ -48,7 +48,8 @@ Hubitat connector:
 5. If the change touched subscriptions, inputs or `initialize()`: `hub_manage_native_rules_and_apps →
    hub_set_native_app` with the instance id and one setting written back at its current value
    (e.g. `{"lrMmwaveEmptyMinutes": 20}` on 584) presses **Done**. Empty settings are rejected. A Done press drops
-   every manual hold and re-applies the scene, so pick a moment when nobody has set a light by hand.
+   every manual hold and re-applies the scene, so pick a moment when nobody has set a light by hand. The re-apply
+   itself changes no level: the factor, the morning ramp and (since v1.58) a dimmed kitchen zone carry over.
 
 ## Great Room: manual changes (v1.41-1.42)
 
@@ -184,7 +185,7 @@ version 22, app v1.26).
 
 ## Audit 2026-11-09
 
-Fixed that day (Great Room v1.57, Govee v1.15, Garage Door Blink v2.1, deploy.sh): see the version notes at the top
+Fixed that day (Great Room v1.57 and v1.58, Govee v1.15, Garage Door Blink v2.1, deploy.sh): see the version notes at the top
 of each file. Settings the code stopped reading long ago were removed from the installed apps; their last values, in
 case one is ever wanted again: Great Room `cansLuxThreshold` 150, `chromecast` device 423 (Foyer TV),
 `chromecastIdleDelay` 300, `chromecastPlayDelay` 120, `partyEndDate` 11-08; Govee `gameBulbCount` 15.

@@ -6,6 +6,8 @@
  *
  *  Author: Claude (for Ashwin)
  *  Date: 2026-02-12
+ *  Version: 1.58 - an app update (Done) keeps a dimmed kitchen zone dimmed instead of bringing it back to full for five
+ *                  minutes: the scenes already kept the dim through a re-apply, only the restart forgot it
  *  Version: 1.57 - audit pass (2026-11-09): one function says which scene the mode and the clock call for (the restart
  *                  path, the scene change and the living-room zone level each had their own copy, and the restart copy
  *                  sent Evening mode to the day scene); TV time survives an app update (the flag was reset while the
@@ -123,7 +125,7 @@ preferences {
     page(name: "mainPage")
 }
 
-def appVersion() { return "1.57" }
+def appVersion() { return "1.58" }
 
 def mainPage() {
     dynamicPage(name: "mainPage", title: "Great Room Lighting Controller", install: true, uninstall: true) {
@@ -349,9 +351,11 @@ def initialize() {
     // the last living-room motion fell inside the 20 s "same movement" grace and the hold ran on)
     if (exitSensors) subscribe(exitSensors, "motion.active", exitHandler)
     if (exitDoors) subscribe(exitDoors, "contact.open", exitHandler)
-    state.kzDimmed = false
+    // A dimmed kitchen zone stays dimmed across a restart, like the factor and the morning ramp below: an app update
+    // never steps the lights (every Done press used to bring a quiet kitchen back to full for five minutes)
+    state.kzDimmed = (state.kzDimmed == true && roomIsOn() && !kzActive())
     if (kzActive()) state.kzLastMotionAt = now()
-    else if (kitchenZoneSensors) runIn(((kzDimMinutes ?: 5) as Integer) * 60, "kzDimCheck")
+    else if (kitchenZoneSensors && !state.kzDimmed) runIn(((kzDimMinutes ?: 5) as Integer) * 60, "kzDimCheck")
 
     // Subscribe to kitchen presence for true presence detection
     if (kitchenPresence) {
