@@ -7,13 +7,13 @@ deployed through the hub's MCP Rule Server (`importUrl`), with `deploy.sh` as th
 
 | File | App | Hub instance |
 |------|-----|--------------|
-| GreatRoomLighting.groovy | Great Room Lighting Controller (v1.58) | app:584 (Apps Code id 529) |
-| GoveeHolidayScenes.groovy | Govee Holiday Scenes (v1.15) — scene-by-date for the Govee string lights, deck lights and pathway bulbs | app:590 (Apps Code id 590) |
+| GreatRoomLighting.groovy | Great Room Lighting Controller (v1.60) | app:584 (Apps Code id 529) |
+| GoveeHolidayScenes.groovy | Govee Holiday Scenes (v1.16) — scene-by-date for the Govee string lights, deck lights and pathway bulbs | app:590 (Apps Code id 590) |
 | GarageDoorBlink.groovy | Garage Door Blink (v2.1) — blinks the kitchen pendant through the Hue bridge's on/off signal when the garage door opens | app:597 (Apps Code id 595) |
-| GreatRoomLightingLogger.gs | Google Apps Script webhook for Sheets logging | (Google) |
+| drivers/ESPHome-AthomHumanPresenceSensor.groovy | The Athom presence sensor's driver (third-party, MIT) with a local illuminance deadband and 10-minute heartbeat | Drivers Code id 963 (device 364) |
 | tools/LuxCsvRepair.groovy | One-off utility: rebuilt `lux_clean.csv` on 2026-09-30 (used once, then removed from the hub) | none |
 
-## Lux Logger (Rule Machine rule 543)
+## Lux Logger (Rule Machine rule 543) — disabled 2026-11-11
 
 Appends `date,time,device,value` rows to File Manager `lux_clean.csv` on every
 illuminance change from devices 49 (outdoor), 289, 41, 364. Rule settings that matter:
@@ -151,9 +151,10 @@ color-temperature command on the RGBIC deck lights (they kept the game colors th
 2700 K commands, 2026-11-02 to 11-07). Default since 2026-11-01:
 `GH-ILZ04Q | ct:2700` (the bulb strings keep their DIY, deck and pathway bulbs warm white). Diwali 2026 (custom window 1, 11-01 to 11-08):
 `LED Bulb String Lights = Pastel; Front String Lights = Pastel; Smart LED Bulb = alt:#FFB3C6/#C8A2FF; Smart LED Bulb 2 = alt:#FFB3C6/#C8A2FF`
-(deck lights keep the default). The window is MM-DD and repeats every year, and Diwali moves: give it new dates before November 2027.
+(deck lights keep the default). Since v1.16 the window is `diwali-7` to `diwali`: the week before Diwali through Diwali day, from a table of
+Lakshmi Puja dates for 2026-2036 (Drik Panchang) in `diwaliDates()`. Extend the table before 2037.
 
-## Motion Logger (Rule Machine rule 544)
+## Motion Logger (Rule Machine rule 544) — disabled 2026-11-11
 
 Same shape as the Lux Logger: appends `date,time,device,value` (motion/roomState/mmwave
 values) to `motion.csv`. Fixed the same way on 2026-09-30; raw original kept as
@@ -173,13 +174,13 @@ version 22, app v1.26).
   (http://HUB/app/editor/ID), not the installed instance ids (app:584).
 - If the hub has login security enabled, deploy.sh needs a session cookie
   step added (currently assumes open LAN access).
-- The Athom presence sensor (device 364, 192.168.86.227) reports illuminance every few seconds
-  (it flips between two neighbouring values) and was throttled by the hub for it in the past
-  (LimitExceededException). No throttling in the hub log on 2026-11-09, but it is still the
-  chattiest device on the hub; raising its illuminance reporting interval in ESPHome would end it.
-- Hub modes: Mode Manager sets Day when outdoor lux rises above 300 and Night when it falls below 200;
-  Rule Machine rule 565 sets Night whenever the TV Time switch (419) turns off. Nothing sets Evening,
-  Away or Early Morning, so the Great Room app's Evening branches never run.
+- The Athom presence sensor (device 364, 192.168.86.227) reports illuminance every few seconds with a few lux of
+  jitter. Since 2026-11-11 its driver (drivers/, Drivers Code 963) turns a reading into an event only on a move of
+  5 lux or 10%, or after 10 minutes. Keep the heartbeat: the Great Room app reads 30 minutes without an event as a
+  dead sensor.
+- Hub modes: Mode Manager sets Day when outdoor lux rises above 300 and Night when it falls below 200, nothing else
+  (the TV Time mode trigger and rule 565 went on 2026-11-11). Evening, Away, Early Morning and TV Time exist but
+  nothing sets them; the Great Room app treats any mode but Night as day. TV time in the app is the switch (419).
 - Hubitat saves an app's `state` when an execution ends. An app that compares events with what it
   just wrote to `state` needs `singleThreaded: true` (all three apps here have it).
 
@@ -190,22 +191,24 @@ of each file. Settings the code stopped reading long ago were removed from the i
 case one is ever wanted again: Great Room `cansLuxThreshold` 150, `chromecast` device 423 (Foyer TV),
 `chromecastIdleDelay` 300, `chromecastPlayDelay` 120, `partyEndDate` 11-08; Govee `gameBulbCount` 15.
 
-Left alone, waiting for a decision:
+Decided on 2026-11-11 and done the same day:
 
-- An off press on a wall switch holds that light off until the next scene change or 6 h. Asked for: have it come
-  back sooner (on the next kitchen-zone entry, or a shorter limit for off presses).
-- With the scene off, the app still judges "is the room lit" by any light being on: a lamp switched on by hand in a
-  room it considers bright is switched off 10-20 minutes later, and a hand-lit lamp at a 40-99 lux kitchen reading
-  brings the whole room on after the 10-minute debounce.
-- Sheets logging is off (`webhookUrl` is blank and no `luxSensor` is selected): the 34 `safeLogToSheet` calls,
-  the `luxSensor` input and `GreatRoomLightingLogger.gs` (which also drops a lux of 0) do nothing.
-- The cloud-cover rule (weather device 424) can only matter in Day mode with 70%+ cloud and outdoor lux between
-  about 200 and 700; the indoor sensors already cover a dull room.
-- The three switch-LED settings do nothing (see "manual changes").
-- The hallway dimmer (128) cannot fade: its firmware rejects a duration and its driver logs a warning on every
-  timed command.
-- `lux_clean.csv` (4.0 MB) and `motion.csv` (2.8 MB) grow without limit and every append rewrites the file.
-- Room Lighting "Outdoor Lights" (418) still lists the dual plug 315/316, silent since December 2024.
+- Great Room v1.60: a kitchen, dining or hallway light switched off by hand comes back when the kitchen side is next
+  entered after its dim time (5 min) of quiet; with no scene up, a lamp lit by hand is left alone; Sheets logging,
+  the cloud-cover rule (last values: weather device 424, 70 %, 400 lux) and the Evening branches removed;
+  `GreatRoomLightingLogger.gs` deleted from the repo (the Apps Script and Sheet in Google are untouched). The dead
+  Ring front door sensor (55) is out of the exit doors.
+- The hallway dimmer (128) runs jtp10181's "Zooz ZEN Dimmer Advanced" and fades. Its LED shows a manual hold by
+  staying lit (a ZEN27 has one colour); the cans (399) still use the built-in driver, so their LED shows nothing.
+- Govee v1.16: Diwali window follows the real date.
+- Mode Manager no longer sets TV Time; rule 565 and the empty rule "Light" (447) deleted (MCP backups kept).
+- Outdoor Lights (418) automates 394, 395, 396, 397 (the dead dual plug 315/316 removed).
+- Lux Logger (543) and Motion Logger (544) disabled; their CSV files are still on the hub.
+- Rule "Google Sheets" (336) now sets LuxStore and TempStore from the outdoor sensor before its GET.
+- Disabled, deletion waiting for a yes: Rachio Community (446) and its devices 345-347, Harmony Hub 323 with
+  children 327-329, Ring Front Door Sensor 55, Device Watchdog child "Athom" (586, duplicated the app's check).
+- Frame dashboard (Mac mini, ~/frame-dashboard): polls Maker API every 30 s instead of 10 s and the mode every
+  5 min; device map drops 127, 42, 55 and the dryer 363, adds the LED Bulb String Lights 433 to Outdoor.
 
 Hub leftovers found in the same pass (none of them this repo's code):
 
