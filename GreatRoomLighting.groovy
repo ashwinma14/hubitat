@@ -6,6 +6,15 @@
  *
  *  Author: Claude (for Ashwin)
  *  Date: 2026-02-12
+ *  Version: 1.60 - decisions of 2026-11-11 on the audit list (1.59, a fade-report hardening, was prepared and not shipped):
+ *                  a kitchen, dining or hallway light switched OFF by hand comes back when the kitchen side is next
+ *                  entered after its dim time of quiet (it used to wait for a scene change or six hours);
+ *                  a lamp lit by hand while no scene is up is left alone (it was switched off 10-20 minutes later when
+ *                  the room read bright, and at 40-99 lux it brought the whole room on): "the lights are on" now means
+ *                  the automation's own scene, for the turn-on bar, the bright turn-off, the debounce and the fade-in;
+ *                  removed: Google Sheets logging (33 calls, the logging sensor, the webhook), the cloud-cover rule with
+ *                  its weather device and two thresholds, the Evening-mode branches (nothing sets that mode);
+ *                  the LED colour command is not sent to a ZEN2x (one-colour LED)
  *  Version: 1.58 - an app update (Done) keeps a dimmed kitchen zone dimmed instead of bringing it back to full for five
  *                  minutes: the scenes already kept the dim through a re-apply, only the restart forgot it
  *  Version: 1.57 - audit pass (2026-11-09): one function says which scene the mode and the clock call for (the restart
@@ -125,7 +134,7 @@ preferences {
     page(name: "mainPage")
 }
 
-def appVersion() { return "1.58" }
+def appVersion() { return "1.60" }
 
 def mainPage() {
     dynamicPage(name: "mainPage", title: "Great Room Lighting Controller", install: true, uninstall: true) {
@@ -140,9 +149,7 @@ def mainPage() {
             input "exitDoors", "capability.contactSensor", title: "Exit doors (the front door): opening after the living room last moved means somebody left it", required: false, multiple: true
             input "indoorLuxSensor", "capability.illuminanceMeasurement", title: "Indoor Lux Sensor (for dark room detection)", required: false
             input "indoorLuxSensor2", "capability.illuminanceMeasurement", title: "Second indoor lux sensor (true-lux sensor such as the kitchen Hue motion sensor; the room counts as dark when EITHER sensor says so)", required: false
-            input "outdoorLuxSensor", "capability.illuminanceMeasurement", title: "Outdoor Lux Sensor (adaptive brightness, daytime debounce, cloudy day check)", required: false
-            input "weatherDevice", "capability.relativeHumidityMeasurement", title: "Weather Device (for cloud cover)", required: false, description: "OpenWeatherMap device with cloudiness attribute"
-            input "luxSensor", "capability.illuminanceMeasurement", title: "Lux Sensor (for logging only)", required: false
+            input "outdoorLuxSensor", "capability.illuminanceMeasurement", title: "Outdoor Lux Sensor (adaptive brightness, daytime debounce)", required: false
             input "diningSwitch", "capability.switch", title: "Dining Switch", required: true
             input "hallwaySwitch", "capability.switchLevel", title: "Hallway Switch", required: true
             input "kitchenCans", "capability.switch", title: "Kitchen Cans (a dimmer follows the scene levels below; an on/off switch joins above the cans factor)", required: true
@@ -154,16 +161,14 @@ def mainPage() {
         }
         
         section("<b>Mode Settings</b>") {
-            paragraph "Lights turn ON when mode is Night or Evening, OR when indoor lux is below threshold, OR when it's cloudy."
+            paragraph "The lights turn on in Night mode, or whenever the indoor sensors read dark."
             paragraph "Configure your Mode Manager to change modes based on outdoor lux sensor thresholds."
             input "indoorLuxThreshold", "number", title: "Living-room sensor (percentage): turn on when below this with the lights off; with them on it only ever says dark, never bright", defaultValue: 50, required: true, width: 4
             input "indoorLuxThreshold2", "number", title: "Kitchen sensor (lux): turn on when below", defaultValue: 40, required: true, width: 4
             input "indoorBrightLux2", "number", title: "Kitchen sensor (lux): daylight level - the room may turn off once it reads this with the lights on (the lights themselves add about 30 lux at this sensor)", defaultValue: 100, required: true, width: 4
             input "bookcaseKitchenCeiling", "number", title: "Kitchen sensor (lux): the living-room sensor may turn the room on only while the kitchen reads below this with the lights off. Keep it at least 30 under the daylight level, or the room loops on and off (2026-10-23)", defaultValue: 60, required: true, width: 4
-            input "cloudyThreshold", "number", title: "Cloud cover % threshold (turn on if above)", defaultValue: 70, required: true
-            input "cloudyLuxThreshold", "number", title: "Outdoor lux threshold for cloudy check", defaultValue: 400, required: true
             input "presenceTimeout", "number", title: "Minutes before presence times out", defaultValue: 8, required: true
-            input "manualOverrideMinutes", "number", title: "A switch press takes that one light out of the automation until the next scene change (predawn end, wind-down, mode change, TV time, everyone leaving) or this many minutes, whichever is first (0 = scene changes only). A press put back within 10 s counts for nothing; three presses in 30 s is play and the light is put back; a brighter press during the morning ramp becomes a floor the ramp continues from.", defaultValue: 360, required: true
+            input "manualOverrideMinutes", "number", title: "A switch press takes that one light out of the automation until the next scene change (predawn end, wind-down, mode change, TV time, everyone leaving) or this many minutes, whichever is first (0 = scene changes only). A kitchen, dining or hallway light switched OFF by hand comes back sooner: the next time somebody enters the kitchen side after it has been quiet for the dim time below. A press put back within 10 s counts for nothing; three presses in 30 s is play and the light is put back; a brighter press during the morning ramp becomes a floor the ramp continues from.", defaultValue: 360, required: true
             input "appChangesAreManual", "bool", title: "Changes from the Hue app, a dashboard or another app count as manual too (anything that is not this app's own command)", defaultValue: true
             input "partyMode", "bool", title: "Party mode: a light somebody set by hand stays that way until the room turns off for an empty house. Scene changes, mode changes, wind-down, the time limit and the three-presses rule all leave it alone", defaultValue: false, submitOnChange: true
             if (partyMode) {
@@ -171,7 +176,7 @@ def mainPage() {
                 input "partyFrom", "text", title: "From (HH:mm; blank = all day)", required: false, width: 4
                 input "partyTo", "text", title: "To (HH:mm; blank = all day). When the party ends, hand-set lights go back to the automation", required: false, width: 4
             }
-            input "overrideLedColor", "enum", title: "Switch LED color while a light is under manual control (Zooz ZEN7x switches with the Advanced driver only)", options: ["Red", "Green", "White", "Blue"], defaultValue: "Red", width: 4
+            input "overrideLedColor", "enum", title: "Switch LED color while a light is under manual control (Zooz switches on the Advanced driver: a ZEN7x changes color, a ZEN2x keeps its LED lit)", options: ["Red", "Green", "White", "Blue"], defaultValue: "Red", width: 4
             input "normalLedColor", "enum", title: "That switch's normal LED color", options: ["Blue", "White", "Green", "Red"], defaultValue: "Blue", width: 4
             input "normalLedMode", "enum", title: "Its normal LED mode", options: ["Default", "Reverse", "Off", "On"], defaultValue: "Default", width: 4
             input "lightsOffDelay", "number", title: "Seconds delay before turning lights off", defaultValue: 10, required: true
@@ -265,7 +270,6 @@ def mainPage() {
         section("<b>Logging</b>") {
             input "logEnable", "bool", title: "Enable debug logging", defaultValue: true
             input "logEnableMinutes", "number", title: "Disable debug logging after (minutes, 0=never)", defaultValue: 30
-            input "webhookUrl", "text", title: "Google Sheets Webhook URL (optional)", required: false
         }
         
         section("<b>App Control</b>") {
@@ -306,8 +310,6 @@ def initialize() {
     log.info "  Indoor Lux Sensor: ${indoorLuxSensor?.displayName ?: 'not configured'}"
     log.info "  Indoor Lux Sensor 2: ${indoorLuxSensor2?.displayName ?: 'not configured'}"
     log.info "  Outdoor Lux Sensor: ${outdoorLuxSensor?.displayName ?: 'not configured'}"
-    log.info "  Weather Device: ${weatherDevice?.displayName ?: 'not configured'}"
-    log.info "  Lux Sensor (logging): ${luxSensor?.displayName ?: 'not configured'}"
     log.info "  Dining: ${diningSwitch?.displayName}"
     log.info "  Hallway: ${hallwaySwitch?.displayName}"
     log.info "  Kitchen Cans: ${kitchenCans?.displayName}"
@@ -354,6 +356,7 @@ def initialize() {
     // A dimmed kitchen zone stays dimmed across a restart, like the factor and the morning ramp below: an app update
     // never steps the lights (every Done press used to bring a quiet kitchen back to full for five minutes)
     state.kzDimmed = (state.kzDimmed == true && roomIsOn() && !kzActive())
+    state.kzQuietSince = kzActive() ? null : (state.kzQuietSince ?: now())
     if (kzActive()) state.kzLastMotionAt = now()
     else if (kitchenZoneSensors && !state.kzDimmed) runIn(((kzDimMinutes ?: 5) as Integer) * 60, "kzDimCheck")
 
@@ -370,19 +373,9 @@ def initialize() {
         subscribe(indoorLuxSensor2, "illuminance", indoorLuxHandler)
     }
     
-    // Subscribe to weather device for cloud cover changes
-    if (weatherDevice) {
-        subscribe(weatherDevice, "cloudiness", cloudHandler)
-    }
-    
     // Subscribe to outdoor lux: it drives the adaptive brightness bands
     if (outdoorLuxSensor) {
         subscribe(outdoorLuxSensor, "illuminance", outdoorLuxHandler)
-    }
-    
-    // Subscribe to illuminance for logging only
-    if (luxSensor) {
-        subscribe(luxSensor, "illuminance", luxHandler)
     }
     
     // Subscribe to TV Time switch
@@ -465,13 +458,8 @@ def initialize() {
 }
 
 def delayedInitialEvaluation() {
-    def currentLux = luxSensor?.currentIlluminance ?: 0
-    
     log.info "Initialization complete. State: presence=${state.presenceActive}, lightNeeded=${state.lightNeeded}, mode=${location.mode}, paused=${appPaused}"
-    
-    // Log initialization to Google Sheets
-    safeLogToSheet("init", "complete", "App started v${appVersion()}", currentLux)
-    
+
     // Check if paused
     if (appPaused) {
         log.info "App is paused - not taking any action"
@@ -504,13 +492,11 @@ def disableLogging() {
 // ==================== LIGHT NEEDED LOGIC ====================
 
 def isLightNeeded() {
-    // Light is needed if:
-    // 1. Mode is Night or Evening (outdoor sensor triggered dusk), OR
-    // 2. Indoor lux is below threshold (cloudy day, dark room), OR
-    // 3. Cloud cover is high AND outdoor lux is below cloudy threshold
-    
-    def modeNeedsLight = (location.mode == "Night" || location.mode == "Evening")
-    
+    // Light is needed in Night mode (the outdoor sensor says dusk), or when the indoor sensors read dark.
+    // (A cloud-cover rule used to sit here as a third reason. It could only matter in Day mode between about 200 and 700
+    // outdoor lux, where the indoor sensors already decide; removed in v1.60 with the weather device.)
+    def modeNeedsLight = (location.mode == "Night")
+
     // Two indoor sensors vote. The kitchen Hue sensor reads real lux: dark below its threshold, and once the lights are on
     // it has to read real daylight (the bright level) before the room may turn off, so the pendants' own light cannot
     // end the night. The bookcase ZSE40 reads a capped percentage that the living-room lights push up by ~40 points,
@@ -520,49 +506,26 @@ def isLightNeeded() {
     // The ceiling sits under the daylight level by more than the lights add at the kitchen sensor, so a room that just
     // turned off for daylight cannot be turned straight back on by the bookcase (2026-11-01: 109 lux with the lights on,
     // ~79 without, dull but lit; the old 150 bar kept the room on all day).
-    // Any of the room's lights lifts the kitchen sensor (the pendant most of all), so all of them count, not just the
-    // two wired kitchen circuits: on 2026-11-08 the pendant was on at 100%, the sensor read 54 lux, and with only the
-    // dining and cans checked the app took that as daylight and turned the room off
-    def lightsCurrentlyOn = (diningSwitch?.currentSwitch == "on" || kitchenCans?.currentSwitch == "on" ||
-                             kitchenPendant?.currentSwitch == "on" || hallwaySwitch?.currentSwitch == "on" || lrHueLights?.currentSwitch == "on")
-    boolean kitchenDark = sensorDark(indoorLuxSensor2, indoorLuxThreshold2 ?: 40, lightsCurrentlyOn)
-    boolean bookcaseDark = sensorDark(indoorLuxSensor, indoorLuxThreshold ?: 50, lightsCurrentlyOn)
+    // "The lights are on" means the automation has a scene up, whichever of its lights are lit (2026-11-08: only the
+    // pendant was on, at 100%, the sensor read 54 lux, and counting just the dining and cans took that for daylight).
+    // A lamp somebody switched on by hand in a room that is off does not count: it used to move the turn-on bar from
+    // 40 to 100 lux, and ten minutes later the whole room came on around it.
+    boolean lit = sceneIsLit()
+    boolean kitchenDark = sensorDark(indoorLuxSensor2, indoorLuxThreshold2 ?: 40, lit)
+    boolean bookcaseDark = sensorDark(indoorLuxSensor, indoorLuxThreshold ?: 50, lit)
     boolean indoorNeedsLight = kitchenDark || (bookcaseDark && !kitchenAboveCeiling())
-    
-    // Cloud cover check - if cloudy and not bright enough outside
-    // Uses hysteresis: lights ON when outdoor lux drops below cloudyLuxThreshold (400)
-    // lights OFF when outdoor lux rises above cloudyLuxThreshold + 300 (700)
-    def cloudiness = weatherDevice?.currentValue("cloudiness") as Integer ?: 0
-    def cloudThreshold = cloudyThreshold ?: 70
-    def luxThreshold = cloudyLuxThreshold ?: 400
-    def luxOffThreshold = luxThreshold + 300  // Hysteresis for outdoor lux
-    def outdoorLux = outdoorLuxSensor?.currentIlluminance ?: 1000  // Default high so it won't trigger without sensor
-    
-    def cloudyNeedsLight = false
-    if (cloudiness >= cloudThreshold) {
-        if (lightsCurrentlyOn) {
-            // Lights are on - only turn off if outdoor lux rises well above threshold
-            cloudyNeedsLight = (outdoorLux < luxOffThreshold)
-        } else {
-            // Lights are off - turn on if outdoor lux drops below threshold
-            cloudyNeedsLight = (outdoorLux < luxThreshold)
-        }
-    }
 
     // A covered or failed outdoor sensor reads "night" all day and drags the mode with it (2026-10-11: 11,229 lux at
     // 13:56, 31 lux a minute later, and Night mode for the next 23 hours). While the sun is up and the room reads bright,
-    // the sensor is overruled: the indoor sensors decide, and the cloud rule (which also trusts it) is off.
-    if (outdoorSensorImplausible()) {
-        if (modeNeedsLight && !indoorNeedsLight) {
-            modeNeedsLight = false
-            warnOutdoorSensor(outdoorLux)
-        }
-        cloudyNeedsLight = false
+    // the sensor is overruled: the indoor sensors decide.
+    if (outdoorSensorImplausible() && modeNeedsLight && !indoorNeedsLight) {
+        modeNeedsLight = false
+        warnOutdoorSensor(outdoorLuxSensor?.currentIlluminance)
     }
 
-    logDebug "isLightNeeded: mode=${location.mode} (${modeNeedsLight}), indoor ${indoorReadings()} lightsOn=${lightsCurrentlyOn} (${indoorNeedsLight}), clouds=${cloudiness}%/${cloudThreshold}% outdoorLux=${outdoorLux}/${luxThreshold}/${luxOffThreshold} (${cloudyNeedsLight})"
+    logDebug "isLightNeeded: mode=${location.mode} (${modeNeedsLight}), indoor ${indoorReadings()} sceneLit=${lit} (${indoorNeedsLight})"
 
-    return modeNeedsLight || indoorNeedsLight || cloudyNeedsLight
+    return modeNeedsLight || indoorNeedsLight
 }
 
 /** Below 50 lux outdoors an hour or more after sunrise and before sunset is not weather; it is a covered sensor, a dead one, or one knocked to face the ground. */
@@ -627,10 +590,12 @@ String indoorReadings() {
 
 /**
  * Settings left behind by inputs that no longer exist (v1.2x chromecast TV detection, the lux-gated cans, the first
- * party-mode end date). The chromecast one still held a device reference. Removing them changes nothing the code reads.
+ * party-mode end date; since v1.60 the Sheets webhook with its logging sensor and the cloud-cover rule with its weather
+ * device). Some still held a device reference. Removing them changes nothing the code reads.
  */
 void removeRetiredSettings() {
-    ["cansLuxThreshold", "chromecast", "chromecastIdleDelay", "chromecastPlayDelay", "partyEndDate"].each { String old ->
+    ["cansLuxThreshold", "chromecast", "chromecastIdleDelay", "chromecastPlayDelay", "partyEndDate",
+     "webhookUrl", "luxSensor", "weatherDevice", "cloudyThreshold", "cloudyLuxThreshold"].each { String old ->
         if (settings[old] == null) return
         try {
             app.removeSetting(old)
@@ -640,6 +605,7 @@ void removeRetiredSettings() {
         }
     }
     state.remove("manualOverride")   // written since v1.41, never read
+    state.remove("lastLoggedLux")    // Sheets logging, removed in v1.60
 }
 
 def getDiningLevelForAmbient() {
@@ -779,7 +745,6 @@ def checkSensorHealth() {
             state.athomStaleAlerted = true
             log.warn "Athom presence sensor is stale - no events for over ${mins} minutes and re-opening its connection did not help. Power cycle it."
             notifyAll("Great Room: Athom presence sensor looks dead (no events for ${mins}+ min; re-opening its connection from the hub did not help). Power cycle it.")
-            safeLogToSheet("health", "stale", "Athom silent ${mins}+ min", 0)
         } else {
             reconnectAthom(mins, true)   // keeps trying each check; it costs nothing and catches a power cycle the moment it happens
         }
@@ -791,7 +756,6 @@ def checkSensorHealth() {
             state.athomStaleAlerted = false
             log.info "Athom presence sensor recovered - events flowing again"
             notifyAll("Great Room: Athom presence sensor is reporting again.")
-            safeLogToSheet("health", "recovered", "Athom reporting again", 0)
         }
     }
 }
@@ -821,7 +785,6 @@ void unstickMotionZone() {
     if (anyLiveSensorActive()) return
     Integer mins = (presenceTimeout ?: 8) as Integer
     log.info "Motion zone is active, but the only active sensor in it is the silent Athom - starting the ${mins}-minute presence timeout without the zone"
-    safeLogToSheet("timeout", "started", "zone held by stale Athom", 0)
     state.pendingPresenceOff = true
     runIn(mins * 60, presenceTimedOut)
 }
@@ -891,11 +854,7 @@ def isTruePresenceDetected() {
 
 def motionHandler(evt) {
     logDebug "Motion event: ${evt.device.displayName} = ${evt.value}"
-    def currentLux = luxSensor?.currentIlluminance ?: 0
-    
-    // Log motion event to Google Sheets (wrapped to prevent crashes)
-    safeLogToSheet("motion", evt.value, evt.device.displayName, currentLux)
-    
+
     if (evt.value == "active") {
         zoneActive()
     } else {
@@ -904,7 +863,6 @@ def motionHandler(evt) {
             state.pendingPresenceOff = true
             def timeoutSeconds = (presenceTimeout ?: 8) * 60
             logDebug "Motion zone inactive - starting ${presenceTimeout} minute timeout"
-            safeLogToSheet("timeout", "started", "${presenceTimeout} minutes", currentLux)
             runIn(timeoutSeconds, presenceTimedOut)
         }
     }
@@ -930,12 +888,10 @@ void zoneActive() {
 
 def presenceTimedOut() {
     logDebug "Presence timeout reached - checking true presence"
-    def currentLux = luxSensor?.currentIlluminance ?: 0
     
     // Check if someone is still present via mmWave/radar
     if (isTruePresenceDetected()) {
         logDebug "True presence still detected - keeping lights on"
-        safeLogToSheet("timeout", "extended", "True presence detected", currentLux)
         state.pendingPresenceOff = false
         // Re-check in 2 minutes
         runIn(120, presenceTimedOut)
@@ -948,13 +904,11 @@ def presenceTimedOut() {
         long mmEmpty = mmwaveEmptyMinutes()
         String mmText = mmEmpty < 0 ? "mmWave not reading empty" : "mmWave empty ${mmEmpty} min of ${lrMmwaveEmptyMinutes ?: 20}"
         log.info "Presence timeout, but the living room is a dead end and nothing outside it has moved since it was last occupied (${quietMin} min ago) - keeping the lights (${mmText}; backstop ${lrBackstopMinutes ?: 45} min)"
-        safeLogToSheet("timeout", "extended", "Living room dead-end inference", currentLux)
         state.pendingPresenceOff = false
         runIn(300, presenceTimedOut)
         return
     }
     
-    safeLogToSheet("timeout", "completed", "Presence cleared", currentLux)
 
     long mmEmpty = mmwaveEmptyMinutes()
     long lrQuiet = state.lastLrMotionAt ? (now() - (state.lastLrMotionAt as Long)) / 60000L : -1L
@@ -967,28 +921,12 @@ def presenceTimedOut() {
 
 def truePresenceHandler(evt) {
     logDebug "True presence event: ${evt.device.displayName} ${evt.name} = ${evt.value}"
-    def currentLux = luxSensor?.currentIlluminance ?: 0
     
     // If presence detected and we have a pending timeout, cancel it
     if ((evt.value == "active" || evt.value == "occupied") && state.pendingPresenceOff) {
         logDebug "True presence detected - canceling pending timeout"
         unschedule(presenceTimedOut)
         state.pendingPresenceOff = false
-        safeLogToSheet("presence", "true presence", evt.device.displayName, currentLux)
-    }
-}
-
-def luxHandler(evt) {
-    // Lux sensor is now just for logging, not for triggering light changes
-    def lux = evt.value.toInteger()
-    
-    logDebug "Illuminance changed: ${lux} lux (logging only)"
-    
-    // Log lux changes to Google Sheets (only significant changes)
-    def lastLoggedLux = state.lastLoggedLux ?: 0
-    if (Math.abs(lux - lastLoggedLux) >= 10) {
-        safeLogToSheet("lux", lux.toString(), "mode: ${location.mode}", lux)
-        state.lastLoggedLux = lux
     }
 }
 
@@ -1027,7 +965,6 @@ def indoorLuxHandler(evt) {
                     }
                 } else {
                     log.info "Room reads dark (${indoorReadings()}) - turning on lights"
-                    safeLogToSheet("indoorLux", lux.toString(), "below threshold, turning on", lux)
                     evaluateLighting("indoor lux changed to ${lux}")
                 }
             } else {
@@ -1037,9 +974,8 @@ def indoorLuxHandler(evt) {
                     state.pendingDarkOn = false
                     log.info "Indoor readings back above threshold (${indoorReadings()}) - daytime turn-on cancelled"
                 }
-                if (!state.pendingBrightOff) {
+                if (!state.pendingBrightOff && sceneIsLit()) {
                     log.info "Indoor readings rose above threshold (${indoorReadings()}) - will turn off in 10 minutes if still bright"
-                    safeLogToSheet("indoorLux", lux.toString(), "above threshold, scheduling off", lux)
                     state.pendingBrightOff = true
                     runIn(600, turnOffDueToBright)  // 10 minutes
                 }
@@ -1055,40 +991,14 @@ def indoorLuxHandler(evt) {
 
 def turnOffDueToBright() {
     state.pendingBrightOff = false
-    def lux = indoorLuxSensor?.currentIlluminance ?: 0
-    
+
     // Verify still bright before turning off (both sensors, same hysteresis as the turn-on decision)
     state.lightNeeded = isLightNeeded()
     if (!state.lightNeeded && state.presenceActive && !state.tvTimeActive) {
         log.info "Still bright after 10 minutes (${indoorReadings()}) - turning off lights"
-        safeLogToSheet("indoorLux", lux.toString(), "still bright, turning off", lux)
         evaluateLighting("bright for 10+ minutes")
     } else {
         log.info "Conditions changed - not turning off (${indoorReadings()})"
-    }
-}
-
-def cloudHandler(evt) {
-    def cloudiness = evt.value.toInteger()
-    def threshold = cloudyThreshold ?: 70
-    
-    logDebug "Cloud cover changed: ${cloudiness}% (threshold: ${threshold}%)"
-    
-    // If presence is active, check if lighting needs to change
-    if (state.presenceActive && !state.tvTimeActive) {
-        def wasLightNeeded = state.lightNeeded
-        state.lightNeeded = isLightNeeded()
-        
-        if (wasLightNeeded != state.lightNeeded) {
-            if (state.lightNeeded) {
-                log.info "Cloud cover increased to ${cloudiness}% - turning on lights"
-                safeLogToSheet("cloud", cloudiness.toString(), "above threshold, turning on", cloudiness)
-            } else {
-                log.info "Cloud cover decreased to ${cloudiness}% - turning off lights"
-                safeLogToSheet("cloud", cloudiness.toString(), "below threshold, turning off", cloudiness)
-            }
-            evaluateLighting("cloud cover changed to ${cloudiness}%")
-        }
     }
 }
 
@@ -1107,24 +1017,20 @@ def outdoorLuxHandler(evt) {
     if (newDiningLevel != lastDiningLevel && state.presenceActive && state.lightNeeded && !state.tvTimeActive) {
         state.lastDiningLevel = newDiningLevel
         log.info "Outdoor lux ${lux} -> dining level ${newDiningLevel}%"
-        safeLogToSheet("ambient", lux.toString(), "dining -> ${newDiningLevel}%", lux)
         if (!overridden(diningSwitch)) diningSwitch?.setLevel(newDiningLevel)
     }
 }
 
 def tvTimeSwitchHandler(evt) {
     logDebug "TV Time switch: ${evt.value}"
-    def currentLux = luxSensor?.currentIlluminance ?: 0
     
     if (evt.value == "on") {
         logDebug "Activating TV Time"
-        safeLogToSheet("tvTime", "activated", "manual switch", currentLux)
         state.tvTimeActive = true
         clearOverrides("TV time")
         evaluateLighting("TV Time activated")
     } else {
         logDebug "Deactivating TV Time"
-        safeLogToSheet("tvTime", "deactivated", "manual switch", currentLux)
         state.tvTimeActive = false
         evaluateLighting("TV Time deactivated")
     }
@@ -1134,8 +1040,6 @@ def resetTvTime() {
     // Auto-reset at 3am in case TV Time was left on
     if (state.tvTimeActive || tvTimeSwitch?.currentSwitch == "on") {
         log.info "3am auto-reset: turning off TV Time"
-        def currentLux = luxSensor?.currentIlluminance ?: 0
-        safeLogToSheet("tvTime", "auto-reset", "3am cleanup", currentLux)
         state.tvTimeActive = false
         tvTimeSwitch?.off()
     }
@@ -1157,12 +1061,10 @@ def livingRoomPresenceHandler(evt) {
 
     // If lights are on and not in override/TV mode, adjust zone levels
     if (lightsOn && !state.tvTimeActive) {
-        def currentLux = luxSensor?.currentIlluminance ?: 0
 
         if (evt.value == "active") {
             // Cancel any pending dim and immediately brighten (LR ceiling only)
             unschedule(applyLrDimmed)
-            safeLogToSheet("zone", "LR active", "brightening", currentLux)
             applyLrZoneLevel(true)
         } else {
             // Delay before dimming to avoid flicker
@@ -1243,15 +1145,48 @@ boolean kzActive() {
 }
 
 def kzActiveHandler(evt) {
+    Long quietSince = state.kzQuietSince as Long
+    state.kzQuietSince = null
     state.kzLastMotionAt = now()
     unschedule("kzDimCheck")
     unschedule("zoneWatchdog")
+    if (quietSince != null) releaseOffHolds(quietSince, "${evt.displayName} ${evt.value}")
     if (state.kzDimmed) kzRestore("${evt.displayName} ${evt.value}")
     liveSensorWhileZoneStuck(evt)
 }
 
+/**
+ * An off press lasts until you have left the kitchen side and come back. Until v1.60 it lasted until the next scene
+ * change or six hours: on 2026-11-09 a hallway switched off at 15:29 would have sat out the whole evening's comings and
+ * goings. A kitchen-zone light that is held OFF by hand goes back to the automation when the zone is entered after
+ * kzDimMinutes of quiet, counted from the press if that came later (a press made while standing still in a "quiet"
+ * kitchen must not be undone by the next step). Levels set by hand, and the living-room lights, keep the old rule.
+ */
+void releaseOffHolds(long quietSince, String why) {
+    if (partyActive()) return
+    long needMs = ((kzDimMinutes ?: 5) as Long) * 60000L
+    Map presses = (state.presses ?: [:]) as Map
+    List back = []
+    [diningSwitch, hallwaySwitch, kitchenCans, kitchenPendant].findAll { it }.each { dev ->
+        if (!overridden(dev) || effectiveLevel(dev) != 0) return
+        long pressAt = (((presses[dev.id.toString()] ?: [:]) as Map).at ?: 0L) as Long
+        if (now() - Math.max(quietSince, pressAt) < needMs) return
+        dropOverride(dev)
+        back << dev
+    }
+    if (!back) return
+    long mins = (now() - quietSince) / 60000L
+    log.info "Kitchen zone entered again (${why}) after ${mins} quiet minutes - ${back*.displayName.join(', ')}, switched off by hand, ${back.size() == 1 ? 'is' : 'are'} back with the automation"
+    // Bring them up with the scene that is running; with no scene up they simply join the next one
+    if (!appPaused && state.presenceActive && state.lightNeeded && !state.tvTimeActive && (state.currentScene ?: "off") != "off") {
+        state.lastAutomationAction = now()
+        applySceneForNow()
+    }
+}
+
 def kzInactiveHandler(evt) {
     if (kzActive()) return
+    if (state.kzQuietSince == null) state.kzQuietSince = now()
     runIn(((kzDimMinutes ?: 5) as Integer) * 60, "kzDimCheck", [overwrite: true])
     // The zone's own inactive edge never comes while a silent Athom holds it; the kitchen going quiet is the next best cue
     if (isAthomStale()) unstickMotionZone()
@@ -1282,7 +1217,6 @@ def zoneWatchdog() {
     if (!state.presenceActive || state.pendingPresenceOff) return
     Integer mins = (presenceTimeout ?: 8) as Integer
     log.warn "Motion zone still active ${zoneWatchdogMinutes ?: 7} min after every sensor in it went quiet - starting the ${mins}-minute presence timeout without it"
-    safeLogToSheet("timeout", "started", "zone watchdog", 0)
     state.pendingPresenceOff = true
     runIn(mins * 60, presenceTimedOut)
 }
@@ -1414,8 +1348,6 @@ def applyLrDimmed() {
         return
     }
 
-    def currentLux = luxSensor?.currentIlluminance ?: 0
-    safeLogToSheet("zone", "LR inactive", "dimming", currentLux)
     applyLrZoneLevel(false)
 }
 
@@ -1440,18 +1372,14 @@ def applyLrZoneLevel(Boolean occupied) {
 
 def modeHandler(evt) {
     logDebug "Mode changed to: ${evt.value}"
-    def currentLux = luxSensor?.currentIlluminance ?: 0
-    
-    // Log mode changes to Google Sheets
-    safeLogToSheet("mode", evt.value, "", currentLux)
-    
+
     // Update lightNeeded based on new mode AND indoor lux
     def wasNeeded = state.lightNeeded
     state.lightNeeded = isLightNeeded()
     
     logDebug "Mode changed: lightNeeded was ${wasNeeded}, now ${state.lightNeeded}"
     
-    if (evt.value in ["Evening", "Night"] && state.pendingDarkOn) {
+    if (evt.value == "Night" && state.pendingDarkOn) {
         unschedule("confirmDarkRoom")
         state.pendingDarkOn = false
     }
@@ -1496,8 +1424,6 @@ def manualSwitchHandler(evt) {
     } else {
         log.info "Physical switch change detected: ${dev.displayName} ${evt.name} = ${evt.value}"
     }
-    def currentLux = luxSensor?.currentIlluminance ?: 0
-    safeLogToSheet("manual", "${evt.name}=${evt.value}", "${dev.displayName} (${isPhysical ? 'physical' : 'app'})", currentLux)
     handleManualChange(dev, nowLevel, cmd?.level == null ? null : (cmd.level as Integer))
 }
 
@@ -1506,6 +1432,7 @@ def manualSwitchHandler(evt) {
 // stopped the morning ramp and the room stayed at predawn levels (2026-10-13). Now a press takes only that device out
 // of the automation; the rest of the room carries on. The device returns at the next scene transition (predawn end,
 // wind-down, a mode change, TV time, everyone leaving, room off) or after manualOverrideMinutes, whichever comes first.
+// Since v1.60 a kitchen-zone light switched OFF by hand also returns when the zone is re-entered (releaseOffHolds).
 // Survey 2026-10-13: a press put back within 10 s is nothing; three presses in 30 s is a child, put it back; a brighter
 // press during the morning ramp is a floor the ramp continues from; the switch LED shows an override where it can.
 
@@ -1685,15 +1612,20 @@ String overrideText() {
     return o.keySet().collect { id -> all.find { it.id.toString() == id }?.displayName ?: "device ${id}" }.join(", ")
 }
 
-/** Switches whose driver exposes the Zooz LED (setLED / setLEDMode) show an override in color; the others cannot. */
+/**
+ * Switches whose driver exposes the Zooz LED (setLED / setLEDMode, i.e. the "Zooz ZEN ... Advanced" drivers) show an
+ * override: a ZEN7x in colour, a ZEN2x by keeping its LED lit. Built-in drivers have neither command and show nothing.
+ */
 void showOverrideLed(dev, boolean on) {
     if (!dev || !dev.hasCommand("setLED") || !dev.hasCommand("setLEDMode")) return
     try {
+        // A ZEN2x (the hallway's ZEN27) has a one-colour LED: its driver takes the mode and only warns about the colour
+        boolean colour = !("${dev.getDataValue('deviceModel') ?: ''}" ==~ /ZEN2\d.*/)
         if (on) {
             dev.setLEDMode("On")
-            dev.setLED(overrideLedColor ?: "Red")
+            if (colour) dev.setLED(overrideLedColor ?: "Red")
         } else {
-            dev.setLED(normalLedColor ?: "Blue")
+            if (colour) dev.setLED(normalLedColor ?: "Blue")
             dev.setLEDMode(normalLedMode ?: "Default")
         }
     } catch (e) {
@@ -1745,15 +1677,18 @@ def evaluateLighting(String reason) {
             logDebug "Light not needed but waiting for bright hysteresis - keeping lights on"
             return
         }
+        if ((state.currentScene ?: "off") == "off") {
+            // No scene is up, so anything that is on was lit by hand: it stays until its owner or an empty house turns it off
+            logDebug "Light not needed and no scene is up - hand-lit lights are left alone"
+            return
+        }
         logDebug "Light not needed - turning lights off"
-        def currentLux = luxSensor?.currentIlluminance ?: 0
-        safeLogToSheet("bright", "off", "Light no longer needed", currentLux)
         turnAllLightsOff()  // Turn off immediately, don't schedule
         return
     }
     
     // Daytime debounce pending (bright outside, dim inside): keep waiting unless the room is already on
-    if (state.pendingDarkOn && !roomIsOn()) {
+    if (state.pendingDarkOn && !sceneIsLit()) {
         logDebug "Dark-room debounce pending - not turning on yet"
         return
     }
@@ -1768,7 +1703,7 @@ def evaluateLighting(String reason) {
 /**
  * Which scene the mode and the clock call for. Night mode: predawn until the predawn end, then the day scene's levels
  * until noon (Night lasts until the outdoor sensor reads 300 lux, which is mid-morning in winter), wind-down from its
- * start time, the night scene otherwise. Evening mode: wind-down or night. Any other mode: day.
+ * start time, the night scene otherwise. Any other mode: day (nothing on this hub sets Evening; its branch went in v1.60).
  * One place, so an app restart, a scene change and the living-room zone level cannot disagree.
  */
 String sceneForNow() {
@@ -1777,7 +1712,6 @@ String sceneForNow() {
         if (isWindDown()) return "winddown"
         return isMorning() ? "day" : "night"
     }
-    if (location.mode == "Evening") return isWindDown() ? "winddown" : "night"
     return "day"
 }
 
@@ -1958,8 +1892,9 @@ boolean roomIsOn() {
 /** Fade for a scene application: long fade-in when the room was off, short when changing an already-lit room. */
 Integer sceneFade(Number override) {
     if (override != null) return override as Integer
-    if (!roomIsOn()) {
-        // Fresh turn-on: start from the current outdoor reading, not a factor left over from last night
+    if (!sceneIsLit()) {
+        // Fresh turn-on (no scene up; a hand-lit lamp does not make the room "on"): start from the current outdoor
+        // reading, not a factor left over from last night
         state.ambientFactor = rawAmbientFactor()
         state.ambientChangedAt = now()
         return (turnOnFadeSeconds ?: 60) as Integer
@@ -2020,7 +1955,9 @@ def ambientRecheck() {
  * same 10-minute debounce the handlers use.
  */
 def brightRoomSafetyNet() {
-    if (appPaused || !roomIsOn() || !state.presenceActive || state.tvTimeActive || state.pendingBrightOff) return
+    // Only a scene the automation put up: a lamp somebody lit by hand in a bright room is theirs (it used to be switched
+    // off 10-20 minutes later)
+    if (appPaused || !sceneIsLit() || !state.presenceActive || state.tvTimeActive || state.pendingBrightOff) return
     // Only hand-set lights on in party mode: nothing for the automation to turn off
     if (partyActive() && ![hallwaySwitch, kitchenPendant, lrHueLights, diningSwitch].any { it?.currentSwitch == "on" && !overridden(it) }) return
     state.lightNeeded = isLightNeeded()
@@ -2038,7 +1975,7 @@ def reapplyCurrentScene(String reason, Integer fade) {
 
 boolean daytimeDebounceApplies() {
     if (adaptiveEnabled == false) return false
-    if (location.mode in ["Evening", "Night"]) return false
+    if (location.mode == "Night") return false
     if (((daytimeOnDebounceMinutes ?: 10) as Integer) <= 0) return false
     def lux = outdoorLuxSensor?.currentIlluminance
     return lux != null && lux >= (adaptiveLux55 ?: 400)
@@ -2090,7 +2027,6 @@ String adaptiveStatus() {
 
 def applyDayScene(Number fadeOverride = null) {
     state.lastAutomationAction = now()
-    def currentLux = luxSensor?.currentIlluminance ?: 0
     Integer fade = sceneFade(fadeOverride)
     if (!state.factorFloor && roomMeasuredDark()) {
         // The room measured dark while it is still "daylight" outside: the 35% band would barely register
@@ -2136,12 +2072,10 @@ def applyDayScene(Number fadeOverride = null) {
     rememberLevels([lr: lrLevel, hallway: state.kzFull.hallway, dining: state.kzFull.dining, cans: state.kzFull.cans])
 
     log.info "Day scene applied (factor ${factor}%, fade ${fade}s${kzDim ? ', kitchen zone dimmed' : ''}, LR ${lrOccupied ? 'occupied' : 'unoccupied'} ${lrLevel}%, hallway ${hallwayLevel}%, dining ${diningLevel}%, cans ${cansText(cansLevel)})"
-    safeLogToSheet("scene", "Day", "factor ${factor}% LR ${lrLevel}% dining ${diningLevel}%", currentLux)
 }
 
 def applyNightScene(Number fadeOverride = null) {
     state.lastAutomationAction = now()
-    def currentLux = luxSensor?.currentIlluminance ?: 0
     Integer fade = sceneFade(fadeOverride)
     Integer factor = effectiveFactor()
     
@@ -2186,12 +2120,10 @@ def applyNightScene(Number fadeOverride = null) {
     rememberLevels([lr: lrLevel, hallway: state.kzFull.hallway, dining: state.kzFull.dining, cans: state.kzFull.cans])
 
     log.info "Night scene applied (factor ${factor}%, fade ${fade}s${hold ? ', hold' : ''}${kzDim ? ', kitchen zone dimmed' : ''}, LR ${lrOccupied ? 'occupied' : 'unoccupied'} ${lrLevel}%, hallway ${hallwayLevel}%, dining ${diningLevel}%, cans ${cansText(cansLevel)})"
-    safeLogToSheet("scene", "Night", "factor ${factor}% LR ${lrLevel}% dining ${diningLevel}%", currentLux)
 }
 
 def applyPredawnScene() {
     state.lastAutomationAction = now()
-    def currentLux = luxSensor?.currentIlluminance ?: 0
 
     def lrOccupied = livingRoomOccupied()
     def lrFull = predawnHueLevel ?: 30
@@ -2217,12 +2149,10 @@ def applyPredawnScene() {
     activatorSwitch?.on()
 
     log.info "Predawn scene applied (LR ${lrOccupied ? 'occupied' : 'unoccupied'})"
-    safeLogToSheet("scene", "Predawn", "gentle wake", currentLux)
 }
 
 def applyWindDownScene() {
     state.lastAutomationAction = now()
-    def currentLux = luxSensor?.currentIlluminance ?: 0
 
     def lrOccupied = livingRoomOccupied()
     def lrFull = windDownHueLevel ?: 50
@@ -2248,12 +2178,10 @@ def applyWindDownScene() {
     activatorSwitch?.on()
 
     log.info "Wind-down scene applied (LR ${lrOccupied ? 'occupied' : 'unoccupied'})"
-    safeLogToSheet("scene", "WindDown", "evening ease", currentLux)
 }
 
 def applyTvScene() {
     state.lastAutomationAction = now()
-    def currentLux = luxSensor?.currentIlluminance ?: 0
     
     // Accent lights - very warm (2200K) and dim
     bookcaseGOLamp?.setColorTemperature(2200)
@@ -2279,7 +2207,6 @@ def applyTvScene() {
     
     logDebug "TV Time scene applied"
     log.info "TV Time scene applied"
-    safeLogToSheet("scene", "TV Time", "accent only", currentLux)
 }
 
 def turnAllLightsOff() {
@@ -2296,7 +2223,6 @@ def turnAllLightsOff() {
     }
     state.lastAutomationAction = now()
     state.turningOff = true
-    def currentLux = luxSensor?.currentIlluminance ?: 0
     if (!keepHandSet) clearOverrides("room turning off")
     else log.info "Party mode: turning the room off but leaving the hand-set lights alone (${overrideText()})"
     state.rampFloor = null
@@ -2315,7 +2241,6 @@ def turnAllLightsOff() {
     unschedule("kzDimCheck")
     
     log.info "All lights turned off"
-    safeLogToSheet("scene", "Off", "all lights off", currentLux)
     state.offRetries = 0
     runIn(15, "verifyAllOff")
 }
@@ -2336,7 +2261,6 @@ def verifyAllOff() {
     String names = stillOn*.displayName.join(", ")
     if (n > 3) {
         log.warn "Still on after three more off commands: ${names} - the switch is not taking commands (radio or driver); check it"
-        safeLogToSheet("health", "off-failed", names, 0)
         return
     }
     log.warn "Still on after the room turned off: ${names} - sending off again (${n} of 3)"
@@ -2352,53 +2276,6 @@ def verifyAllOff() {
 
 def clearTurningOffFlag() {
     state.turningOff = false
-}
-
-// ==================== GOOGLE SHEETS LOGGING ====================
-
-def safeLogToSheet(String eventType, String value, String details, lux) {
-    try {
-        logToSheet(eventType, value, details, lux as Integer)
-    } catch (e) {
-        log.warn "Logging failed (non-fatal): ${e.message}"
-    }
-}
-
-def logToSheet(String eventType, String value, String details, Integer lux) {
-    if (!webhookUrl) {
-        return  // No webhook configured
-    }
-    
-    try {
-        def payload = [
-            timestamp: new Date().format("yyyy-MM-dd HH:mm:ss", location.timeZone),
-            eventType: eventType,
-            value: value,
-            details: details,
-            lux: lux ?: 0,
-            mode: location.mode,
-            presence: state.presenceActive ? "true" : "false"
-        ]
-        
-        def params = [
-            uri: webhookUrl,
-            contentType: "application/json",
-            body: groovy.json.JsonOutput.toJson(payload),
-            timeout: 10
-        ]
-        
-        asynchttpPost(handleLogResponse, params)
-        
-    } catch (e) {
-        logDebug "Error sending to Google Sheets: ${e.message}"
-    }
-}
-
-def handleLogResponse(response, data) {
-    // Silent handler - we don't need to do anything with the response
-    if (response.hasError()) {
-        logDebug "Google Sheets logging error: ${response.getErrorMessage()}"
-    }
 }
 
 // ==================== HELPER FUNCTIONS ====================
