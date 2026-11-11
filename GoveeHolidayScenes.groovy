@@ -15,6 +15,8 @@
  *
  *  Author: Claude (for Ashwin)
  *  Date: 2026-09-29
+ *  Version: 1.16 - window dates may follow Diwali ('diwali-7' to 'diwali'), which moves every year; the Diwali window
+ *                  was a fixed 11-01 to 11-08, right in 2026 and three weeks late in 2027 (2026-11-11 request)
  *  Version: 1.15 - audit pass (2026-11-09): automatic sends (plug power-on, game window, date rollover) leave the
  *                  sunset-timer lights out while it is daylight, as the notes always said they did; every afternoon
  *                  power-on had been sending to the unpowered pathway bulbs four times and logging four "NOT confirmed"
@@ -73,7 +75,7 @@ preferences {
     page(name: "mainPage")
 }
 
-def appVersion() { return "1.15" }
+def appVersion() { return "1.16" }
 
 def mainPage() {
     dynamicPage(name: "mainPage", title: "Govee Holiday Scenes v${appVersion()}", install: true, uninstall: true) {
@@ -113,7 +115,8 @@ def mainPage() {
                       "e.g. 'LED Bulb String Lights = Pastel; Front String Lights = off'. Lights without a rule keep the default scene (or the rule with no name, if there is one). " +
                       "'off' switches a light off (it is switched back on when its next look arrives); 'default' means whatever the default scene gives that light; " +
                       "'ct:2700' is a plain color temperature in kelvin (2700 = warm white, 6500 = cold), which any light with a white channel can show and keeps across a power cut. " +
-                      "Windows are MM-DD and may wrap the year end (e.g. 11-27 to 01-06)."
+                      "Windows are MM-DD and may wrap the year end (e.g. 11-27 to 01-06). " +
+                      "A date may also follow Diwali, which moves every year: 'diwali-7' to 'diwali' is the week before Diwali through Diwali day (2026-2036 on record)."
             input "defaultScene", "text", title: "Default scene outside any window", defaultValue: "Static warm white", required: true, submitOnChange: true
             input "halloweenEnabled", "bool", title: "Halloween window", defaultValue: true, submitOnChange: true
             if (halloweenEnabled) {
@@ -123,14 +126,14 @@ def mainPage() {
             }
             input "custom1Name", "text", title: "Custom window 1 name (blank = unused)", required: false, submitOnChange: true
             if (custom1Name) {
-                input "custom1Start", "text", title: "${custom1Name} start (MM-DD)", required: true, width: 4
-                input "custom1End", "text", title: "${custom1Name} end (MM-DD)", required: true, width: 4
+                input "custom1Start", "text", title: "${custom1Name} start (MM-DD or diwali-N)", required: true, width: 4
+                input "custom1End", "text", title: "${custom1Name} end (MM-DD or diwali)", required: true, width: 4
                 input "custom1Scene", "text", title: "${custom1Name} scene", required: true, width: 4, submitOnChange: true
             }
             input "custom2Name", "text", title: "Custom window 2 name (blank = unused)", required: false, submitOnChange: true
             if (custom2Name) {
-                input "custom2Start", "text", title: "${custom2Name} start (MM-DD)", required: true, width: 4
-                input "custom2End", "text", title: "${custom2Name} end (MM-DD)", required: true, width: 4
+                input "custom2Start", "text", title: "${custom2Name} start (MM-DD or diwali-N)", required: true, width: 4
+                input "custom2End", "text", title: "${custom2Name} end (MM-DD or diwali)", required: true, width: 4
                 input "custom2Scene", "text", title: "${custom2Name} scene", required: true, width: 4, submitOnChange: true
             }
         }
@@ -218,8 +221,11 @@ def initialize() {
     }
 
     windows().each { w ->
-        if (!validDate(w.start) || !validDate(w.end)) {
+        String s0 = windowDate(w.start), e0 = windowDate(w.end)
+        if (!validDate(s0) || !validDate(e0)) {
             log.warn "Window '${w.name}' has an invalid date (${w.start} to ${w.end}); it will be ignored"
+        } else if (s0 != w.start?.trim() || e0 != w.end?.trim()) {
+            log.info "Window '${w.name}' this year: ${s0} to ${e0} (${w.start} to ${w.end})"
         }
     }
 
@@ -989,13 +995,41 @@ List windows() {
 
 Map activeWindow() {
     String today = new Date().format("MM-dd", location.timeZone)
-    return windows().find { w -> w.scene && validDate(w.start) && validDate(w.end) && inWindow(today, w.start, w.end) }
+    return windows().find { w ->
+        String s0 = windowDate(w.start), e0 = windowDate(w.end)
+        w.scene && validDate(s0) && validDate(e0) && inWindow(today, s0, e0)
+    }
 }
 
 /** MM-DD comparison; a window whose end precedes its start wraps the year end. */
 boolean inWindow(String today, String start, String end) {
     if (start <= end) return today >= start && today <= end
     return today >= start || today <= end
+}
+
+/**
+ * A window date: MM-DD, or "diwali" / "diwali-7" / "diwali+1", resolved to this year's Diwali (Lakshmi Puja) date as
+ * MM-DD. Diwali moves with the lunar calendar (2026-11-08, 2027-10-29, 2028-10-17), so a fixed MM-DD window was right
+ * one year in three. Returns the input unchanged when it is not a Diwali token, null when the year is not in the table.
+ */
+String windowDate(String spec, Integer year = null) {
+    String t = spec?.trim()
+    def m = (t ?: "") =~ /(?i)^diwali\s*([+-]\s*\d{1,2})?$/
+    if (!m.matches()) return t
+    Integer y = year ?: (new Date().format("yyyy", location.timeZone) as Integer)
+    String d = diwaliDates()[y]
+    if (!d) { log.warn "No Diwali date on record for ${y}; add it to diwaliDates()"; return null }
+    Integer off = m.group(1) ? (m.group(1).replaceAll(/\s/, "") as Integer) : 0
+    def sdf = new java.text.SimpleDateFormat("yyyy-MM-dd")
+    sdf.setTimeZone(TimeZone.getTimeZone("UTC"))
+    Date base = sdf.parse("${y}-${d}")
+    return new Date(base.time + off * 86400000L).format("MM-dd", TimeZone.getTimeZone("UTC"))
+}
+
+/** Lakshmi Puja (the main Diwali day) by year, from Drik Panchang; US calendars occasionally put it a day either side. */
+Map diwaliDates() {
+    return [2026: "11-08", 2027: "10-29", 2028: "10-17", 2029: "11-05", 2030: "10-26", 2031: "11-14",
+            2032: "11-02", 2033: "10-22", 2034: "11-10", 2035: "10-30", 2036: "10-18"]
 }
 
 boolean validDate(String s) {
