@@ -6,6 +6,12 @@
  *
  *  Author: Claude (for Ashwin)
  *  Date: 2026-02-12
+ *  Version: 1.61 - color temperature follows the scene on the ceiling, both bookcase lamps and the pendant (it was the
+ *                  ceiling only, at fixed values); the day scene goes from 4000 K in daylight to 2700 K as it gets dark;
+ *                  the garage door opening while the downstairs is empty and dark lights the room for the walk in
+ *                  (6 s later, after Garage Door Blink's pendant signal; a departure passes the kitchen sensors first);
+ *                  weekends (and an optional no-school switch) get their own, later predawn end without the sunrise
+ *                  shortcut
  *  Version: 1.60 - decisions of 2026-11-11 on the audit list (1.59, a fade-report hardening, was prepared and not shipped):
  *                  a kitchen, dining or hallway light switched OFF by hand comes back when the kitchen side is next
  *                  entered after its dim time of quiet (it used to wait for a scene change or six hours);
@@ -134,7 +140,7 @@ preferences {
     page(name: "mainPage")
 }
 
-def appVersion() { return "1.60" }
+def appVersion() { return "1.61" }
 
 def mainPage() {
     dynamicPage(name: "mainPage", title: "Great Room Lighting Controller", install: true, uninstall: true) {
@@ -147,6 +153,7 @@ def mainPage() {
             input "kitchenPresence", "capability.motionSensor", title: "Kitchen Presence Sensor (FP1E - for true presence)", required: false
             input "exitSensors", "capability.motionSensor", title: "Exit sensors (the stairs): motion here after the living room last moved means somebody left it, with no grace period", required: false, multiple: true
             input "exitDoors", "capability.contactSensor", title: "Exit doors (the front door): opening after the living room last moved means somebody left it", required: false, multiple: true
+            input "garageDoor", "capability.garageDoorControl", title: "Garage door: opening it while the downstairs is empty and dark lights the room for the walk in", required: false
             input "indoorLuxSensor", "capability.illuminanceMeasurement", title: "Indoor Lux Sensor (for dark room detection)", required: false
             input "indoorLuxSensor2", "capability.illuminanceMeasurement", title: "Second indoor lux sensor (true-lux sensor such as the kitchen Hue motion sensor; the room counts as dark when EITHER sensor says so)", required: false
             input "outdoorLuxSensor", "capability.illuminanceMeasurement", title: "Outdoor Lux Sensor (adaptive brightness, daytime debounce)", required: false
@@ -218,7 +225,9 @@ def mainPage() {
         }
         
         section("<b>Scene Settings - Predawn (gentle wake)</b>") {
-            input "predawnEnd", "text", title: "Predawn ends at (HH:mm, 24h)", defaultValue: "06:15", required: true
+            input "predawnEnd", "text", title: "School days: predawn ends at (HH:mm, 24h; or earlier, near sunrise - see Adaptive Brightness)", defaultValue: "06:15", required: true
+            input "predawnEndWeekend", "text", title: "Weekends: predawn ends at (HH:mm, 24h; no sunrise shortcut, blank = same as school days)", defaultValue: "07:30", required: false
+            input "noSchoolSwitch", "capability.switch", title: "Optional switch that is on for a weekday without school (a holiday): that morning runs on weekend time", required: false
             input "predawnHallwayLevel", "number", title: "Hallway brightness", defaultValue: 20
             input "predawnKitchenPendantLevel", "number", title: "Kitchen Pendant brightness", defaultValue: 10
             input "predawnBookcaseLevel", "number", title: "Bookcase lamps brightness", defaultValue: 10
@@ -234,6 +243,15 @@ def mainPage() {
             input "windDownBookcaseLevel", "number", title: "Bookcase lamps brightness", defaultValue: 10
             input "windDownHueLevel", "number", title: "LR Hue lights brightness", defaultValue: 50
             input "windDownCansLevel", "number", title: "Kitchen cans brightness (dimmer; 0 = off)", defaultValue: 0
+        }
+
+        section("<b>Color temperature</b>") {
+            paragraph "The living-room ceiling, both bookcase lamps and the kitchen pendant follow the scene's color temperature (the Zooz dimmers have none). The day scene runs from the bright-day value down to the night value as it gets darker outside, in the same steps as the brightness."
+            input "ctEnabled", "bool", title: "Set color temperature with each scene", defaultValue: true
+            input "dayKelvin", "number", title: "Day, bright outside (K)", defaultValue: 4000, width: 3
+            input "nightKelvin", "number", title: "Night, and the day scene once dark outside (K)", defaultValue: 2700, width: 3
+            input "windDownKelvin", "number", title: "Wind-down (K)", defaultValue: 2400, width: 3
+            input "predawnKelvin", "number", title: "Predawn (K)", defaultValue: 2200, width: 3
         }
 
         section("<b>Scene Settings - TV Time</b>") {
@@ -353,6 +371,7 @@ def initialize() {
     // the last living-room motion fell inside the 20 s "same movement" grace and the hold ran on)
     if (exitSensors) subscribe(exitSensors, "motion.active", exitHandler)
     if (exitDoors) subscribe(exitDoors, "contact.open", exitHandler)
+    if (garageDoor) subscribe(garageDoor, "door", garageDoorHandler)
     // A dimmed kitchen zone stays dimmed across a restart, like the factor and the morning ramp below: an app update
     // never steps the lights (every Done press used to bring a quiet kitchen back to full for five minutes)
     state.kzDimmed = (state.kzDimmed == true && roomIsOn() && !kzActive())
@@ -634,6 +653,11 @@ def isPredawn() {
 }
 
 Integer predawnEndMinutes() {
+    // Weekend (or no-school) mornings: their own, later time, and no sunrise shortcut - the point is a slower start
+    if (weekendMorning()) {
+        Integer w = hhmmMinutes(predawnEndWeekend)
+        if (w != null) return w
+    }
     def parts = (predawnEnd ?: "06:15").split(":")
     Integer configured = (parts[0] as Integer) * 60 + (parts[1] as Integer)
     if (adaptiveEnabled == false) return configured
@@ -648,6 +672,14 @@ Integer predawnEndMinutes() {
         logDebug "Sunrise lookup failed (${e.message}); using configured predawn end"
         return configured
     }
+}
+
+/** Saturday, Sunday, or a weekday the no-school switch marks as a holiday. */
+boolean weekendMorning() {
+    def cal = java.util.Calendar.getInstance(location.timeZone)
+    Integer dow = cal.get(java.util.Calendar.DAY_OF_WEEK)
+    if (dow == java.util.Calendar.SATURDAY || dow == java.util.Calendar.SUNDAY) return true
+    return noSchoolSwitch?.currentValue("switch") == "on"
 }
 
 def armPredawnEnd() {
@@ -1086,6 +1118,35 @@ def lrMmwaveAnchor() {
 }
 
 /** Somebody went up the stairs or out the front door: whatever the living room last saw, that person left it. */
+/**
+ * Arriving through the garage after dark: the door opens while the downstairs is empty, so the room comes up before
+ * anybody reaches a motion sensor. Leaving the same way passes the kitchen sensors first (presence is active, or the
+ * kitchen side moved in the last few minutes), so a departure does nothing. With no motion afterwards the room goes
+ * off again after the presence timeout.
+ */
+def garageDoorHandler(evt) {
+    if (!(evt.value in ["opening", "open"])) return
+    if (now() - ((state.garageArrivalAt ?: 0L) as Long) < 120000L) return     // "opening" then "open": one arrival
+    if (appPaused || state.presenceActive || state.tvTimeActive) return
+    long kzQuiet = now() - ((state.kzLastMotionAt ?: 0L) as Long)
+    if (kzQuiet < 5 * 60000L) { logDebug "Garage ${evt.value}: the kitchen side moved ${(kzQuiet / 1000) as Long} s ago - a departure, not an arrival"; return }
+    if (!isLightNeeded()) { logDebug "Garage ${evt.value}: light not needed - nothing to do"; return }
+    state.garageArrivalAt = now()
+    log.info "Garage door ${evt.value} with the downstairs empty and dark - lighting the room for the walk in"
+    // After Garage Door Blink's 4 s signal on the pendant: the bridge puts the pendant back as it was when the signal
+    // ends, and a scene sent in the middle of it could be undone
+    runIn(6, "garageArrival")
+}
+
+def garageArrival() {
+    if (appPaused || state.presenceActive || state.tvTimeActive) return    // motion got there first, or TV time
+    zoneActive()
+    if (motionZone?.currentValue("motion") != "active" && !state.pendingPresenceOff) {
+        state.pendingPresenceOff = true
+        runIn(((presenceTimeout ?: 8) as Integer) * 60, presenceTimedOut)
+    }
+}
+
 def exitHandler(evt) {
     state.exitAt = now()
     logDebug "Exit seen: ${evt.displayName} ${evt.value}"
@@ -1923,14 +1984,39 @@ def setLevelSmooth(dev, Number level, Number seconds) {
 }
 
 /**
- * The scene's color temperature for the living-room ceiling. On Hue a color-temperature command also switches the light
- * on, so it has to respect a manual override the way setLevelSmooth does: on 2026-11-09 08:23 it was the one command that
- * reached a room full of (wrongly) held lights and lit the living room on its own.
+ * The scene's color temperature (v1.60 and earlier: the ceiling only, fixed 2700/2700/2400/2200). The day scene runs
+ * from dayKelvin while it is bright outside to nightKelvin once it is dark, by the committed ambient band (outdoor light
+ * alone - not the morning ramp, which would make a morning start cold and turn warm).
  */
-void lrColorTemperature(Integer kelvin) {
-    if (!lrHueLights?.hasCommand("setColorTemperature")) return
-    if (overridden(lrHueLights)) { logDebug "LR Lights: manual override - color temperature left alone"; return }
-    lrHueLights.setColorTemperature(kelvin)
+Integer sceneKelvin(String scene) {
+    Integer night = (nightKelvin ?: 2700) as Integer
+    switch (scene) {
+        case "predawn": return (predawnKelvin ?: 2200) as Integer
+        case "winddown": return (windDownKelvin ?: 2400) as Integer
+        case "night": return night
+    }
+    Integer day = (dayKelvin ?: 4000) as Integer
+    if (adaptiveEnabled == false) return day
+    Integer f = ((state.ambientFactor ?: ambientFactor(false)) ?: 100) as Integer
+    f = Math.max(35, Math.min(100, f))
+    BigDecimal k = day + (night - day) * (f - 35) / 65.0
+    return ((Math.round(k / 100.0) as Integer) * 100) as Integer
+}
+
+/**
+ * Send the scene's color temperature to each Hue light that the scene has on. A Hue color-temperature command also
+ * switches the light on, so a light at 0, or one somebody holds by hand, gets nothing.
+ */
+void applySceneColor(String scene, Map levels) {
+    if (ctEnabled == false) return
+    Integer k = sceneKelvin(scene)
+    [[lrHueLights, levels.lr], [bookcaseGOLamp, levels.bookcase], [bookcaseColorLamp, levels.bookcase], [kitchenPendant, levels.pendant]].each { pair ->
+        def dev = pair[0]
+        if (!dev || !dev.hasCommand("setColorTemperature")) return
+        if (((pair[1] ?: 0) as Integer) <= 0 || overridden(dev)) return
+        try { dev.setColorTemperature(k) } catch (e) { logDebug "${dev.displayName}: setColorTemperature failed (${e.message})" }
+    }
+    state.sceneKelvin = k
 }
 
 /** Re-apply the current day/night scene when the ambient band changes while the room is on. */
@@ -2064,7 +2150,7 @@ def applyDayScene(Number fadeOverride = null) {
     setLevelSmooth(bookcaseColorLamp, scaled(dayBookcaseLevel ?: 50), fade)
     setLevelSmooth(lrHueLights, lrLevel, fade)
     state.lrDimmed = !lrOccupied
-    lrColorTemperature(2700)   // warm white
+    applySceneColor("day", [lr: lrLevel, bookcase: scaled(dayBookcaseLevel ?: 50), pendant: pendantLevel])
     
     activatorSwitch?.on()
     state.currentScene = "day"
@@ -2112,7 +2198,7 @@ def applyNightScene(Number fadeOverride = null) {
     setLevelSmooth(bookcaseColorLamp, scaled(nightBookcaseLevel ?: 15), fade)
     setLevelSmooth(lrHueLights, lrLevel, fade)
     state.lrDimmed = !lrOccupied
-    lrColorTemperature(2700)   // warm white
+    applySceneColor("night", [lr: lrLevel, bookcase: scaled(nightBookcaseLevel ?: 15), pendant: pendantLevel])
     
     activatorSwitch?.on()
     state.currentScene = "night"
@@ -2144,7 +2230,7 @@ def applyPredawnScene() {
     state.currentScene = "predawn"
     state.kzDimmed = false
 
-    lrColorTemperature(2200)   // extra warm for the early morning
+    applySceneColor("predawn", [lr: lrLevel, bookcase: predawnBookcaseLevel ?: 10, pendant: predawnKitchenPendantLevel ?: 10])
 
     activatorSwitch?.on()
 
@@ -2173,7 +2259,7 @@ def applyWindDownScene() {
     state.currentScene = "winddown"
     state.kzDimmed = false
 
-    lrColorTemperature(2400)   // warm for the late evening
+    applySceneColor("winddown", [lr: lrLevel, bookcase: windDownBookcaseLevel ?: 10, pendant: windDownKitchenPendantLevel ?: 15])
 
     activatorSwitch?.on()
 
