@@ -203,10 +203,11 @@ Decided on 2026-11-11 and done the same day:
 - Govee v1.16: Diwali window follows the real date.
 - Mode Manager no longer sets TV Time; rule 565 and the empty rule "Light" (447) deleted (MCP backups kept).
 - Outdoor Lights (418) automates 394, 395, 396, 397 (the dead dual plug 315/316 removed).
-- Lux Logger (543) and Motion Logger (544) disabled; their CSV files are still on the hub.
+- Lux Logger (543) and Motion Logger (544) disabled; `lux_clean.csv` and `motion.csv` deleted from the hub
+  (the 2026-09-30 raw backups and `lux.csv` remain).
 - Rule "Google Sheets" (336) now sets LuxStore and TempStore from the outdoor sensor before its GET.
-- Disabled, deletion waiting for a yes: Rachio Community (446) and its devices 345-347, Harmony Hub 323 with
-  children 327-329, Ring Front Door Sensor 55, Device Watchdog child "Athom" (586, duplicated the app's check).
+- Deleted: Rachio Community (446) with its devices 345-347, Harmony Hub 323 with children 327-329.
+- Disabled, kept: Ring Front Door Sensor 55, Device Watchdog child "Athom" (586, duplicated the app's check).
 - Frame dashboard (Mac mini, ~/frame-dashboard): polls Maker API every 30 s instead of 10 s and the mode every
   5 min; device map drops 127, 42, 55 and the dryer 363, adds the LED Bulb String Lights 433 to Outdoor.
 
