@@ -6,6 +6,10 @@
  *
  *  Author: Claude (for Ashwin)
  *  Date: 2026-02-12
+ *  Version: 1.62 - the presence radars (kitchen FP1E, living-room mmWave) hold the room only while a motion sensor has
+ *                  fired within radarTrustMinutes (120): on 2026-11-13 the kitchen radar reported somebody from 22:08 to
+ *                  04:30 with nobody there and kept the wind-down lights on all night; motion after staleSceneMinutes
+ *                  (30) of none re-checks the scene, so coming down at 04:30 gets predawn, not last night's wind-down
  *  Version: 1.61 - color temperature follows the scene on the ceiling, both bookcase lamps and the pendant (it was the
  *                  ceiling only, at fixed values); the day scene goes from 4000 K in daylight to 2700 K as it gets dark;
  *                  the garage door opening while the downstairs is empty and dark lights the room for the walk in
@@ -140,7 +144,7 @@ preferences {
     page(name: "mainPage")
 }
 
-def appVersion() { return "1.61" }
+def appVersion() { return "1.62" }
 
 def mainPage() {
     dynamicPage(name: "mainPage", title: "Great Room Lighting Controller", install: true, uninstall: true) {
@@ -196,6 +200,8 @@ def mainPage() {
             paragraph "The living room is a dead end: once it has seen someone, it stays occupied until a sensor outside it fires after the living room last did. Sitting still never times the house out; walking out through the kitchen does, and so does the mmWave reading empty for a while with the PIR quiet. The kitchen/dining/hallway zone dims after a few quiet minutes while the room is on and comes straight back on motion."
             input "lrBackstopMinutes", "number", title: "Living room: give up the dead-end inference after this many minutes with no activity anywhere", defaultValue: 45, required: true, width: 6
             input "lrMmwaveEmptyMinutes", "number", title: "...or sooner, once the mmWave has read empty this many minutes with no living-room motion (0 = never)", defaultValue: 20, required: true, width: 6
+            input "radarTrustMinutes", "number", title: "Presence radars (kitchen FP1E, living-room mmWave) keep the room on only while a motion sensor has fired within this many minutes (2026-11-13: the kitchen radar reported somebody for 6 h 22 min with nobody there and held the room on all night)", defaultValue: 120, required: true, width: 6
+            input "staleSceneMinutes", "number", title: "Motion after this many minutes without any motion re-checks the scene (coming down at 04:30 to a room still on last night's wind-down)", defaultValue: 30, required: true, width: 6
             input "zoneWatchdogMinutes", "number", title: "Zone watchdog: if every sensor in the motion zone has been quiet this many minutes and the zone still says active, start the presence timeout without it (the zone's own timeout is 5 min)", defaultValue: 7, required: true, width: 6
             input "lrExitGraceSeconds", "number", title: "Kitchen-zone activity within this many seconds after living-room activity counts as the same movement", defaultValue: 20, required: true, width: 6
             input "lrMmwaveAnchorSeconds", "number", title: "The living-room mmWave must stay active this many seconds before it counts as living-room motion (its shorter blips are noise; the PIR counts at once)", defaultValue: 45, required: true, width: 6
@@ -349,11 +355,13 @@ def initialize() {
         // Its motion attribute (mmWave or PIR) is what the zone app watches: feed the zone watchdog from it too
         subscribe(livingRoomPresence, "motion.active", zoneMemberActiveHandler)
         subscribe(livingRoomPresence, "motion.inactive", zoneMemberQuietHandler)
+        subscribe(livingRoomPresence, "pir.active", pirActiveHandler)
     }
     
     // Living-room PIR: second opinion for the zone dim
     if (lrMotionSensor) {
         subscribe(lrMotionSensor, "motion.active", lrMotionHandler)
+        subscribe(lrMotionSensor, "motion.active", pirActiveHandler)
         subscribe(lrMotionSensor, "motion.inactive", lrMotionInactiveHandler)
         if (lrMotionSensor.currentMotion == "active") state.lastLrMotionAt = now()
     }
@@ -361,6 +369,7 @@ def initialize() {
     // Kitchen zone: activity bookkeeping for the dead-end inference, and the quiet-time dim
     if (kitchenZoneSensors) {
         subscribe(kitchenZoneSensors, "motion.active", kzActiveHandler)
+        subscribe(kitchenZoneSensors, "motion.active", pirActiveHandler)
         subscribe(kitchenZoneSensors, "motion.inactive", kzInactiveHandler)
     }
     if (kitchenPresence) {
@@ -378,6 +387,9 @@ def initialize() {
     state.kzQuietSince = kzActive() ? null : (state.kzQuietSince ?: now())
     if (kzActive()) state.kzLastMotionAt = now()
     else if (kitchenZoneSensors && !state.kzDimmed) runIn(((kzDimMinutes ?: 5) as Integer) * 60, "kzDimCheck")
+
+    if (state.lastPirAt == null) state.lastPirAt = now()
+    armRadarTrust()
 
     // Subscribe to kitchen presence for true presence detection
     if (kitchenPresence) {
@@ -824,7 +836,7 @@ void unstickMotionZone() {
 /** Any motion sensor the app watches other than the Athom. */
 boolean anyLiveSensorActive() {
     if (kitchenZoneSensors?.any { it.currentMotion == "active" }) return true
-    if (kitchenPresence?.currentValue("roomState") == "occupied") return true
+    if (kitchenPresence?.currentValue("roomState") == "occupied" && radarTrusted()) return true
     return lrMotionSensor?.currentMotion == "active"
 }
 
@@ -878,6 +890,10 @@ def isTruePresenceDetected() {
     }
     
     def result = athomPresent || fp1ePresent
+    if (result && !radarTrusted()) {
+        log.info "Presence radars say somebody is here (athom=${athomPresent}, fp1e=${fp1ePresent}), but no motion sensor has fired in ${radarTrustMinutes ?: 120} min - not counting them"
+        return false
+    }
     logDebug "True presence detected: ${result} (athom=${athomPresent}, fp1e=${fp1ePresent})"
     return result
 }
@@ -1254,6 +1270,53 @@ def kzInactiveHandler(evt) {
     zoneMemberQuietHandler(evt)
 }
 
+// ==================== MOTION VS. RADAR ====================
+
+/**
+ * A motion sensor (a PIR: the kitchen-side sensors, the living-room bookcase sensor, the Athom's own PIR) fired. Radars
+ * (the kitchen FP1E, the Athom's mmWave) see a person sitting still, but they also see things that are not people; a
+ * PIR does not. Every PIR event renews the radars' trust, and the first one after a long quiet re-checks the scene.
+ */
+def pirActiveHandler(evt) {
+    long prev = (state.lastPirAt ?: 0L) as Long
+    state.lastPirAt = now()
+    armRadarTrust()
+    long quietMin = (now() - prev) / 60000L
+    if (state.presenceActive && prev > 0L && quietMin >= ((staleSceneMinutes ?: 30) as Long) && !state.tvTimeActive) {
+        log.info "${evt.displayName} motion after ${quietMin} minutes without any - re-checking the scene"
+        evaluateLighting("motion after ${quietMin} quiet minutes")
+    }
+}
+
+/** The radars count while a PIR has fired within radarTrustMinutes. */
+boolean radarTrusted() {
+    long mins = ((radarTrustMinutes != null ? radarTrustMinutes : 120) as Long)
+    if (mins <= 0) return true
+    return now() - ((state.lastPirAt ?: now()) as Long) < mins * 60000L
+}
+
+void armRadarTrust() {
+    long mins = ((radarTrustMinutes != null ? radarTrustMinutes : 120) as Long)
+    if (mins <= 0) return
+    long left = mins * 60000L - (now() - ((state.lastPirAt ?: now()) as Long))
+    long secs = (long) (left / 1000L) + 30L
+    runIn((secs < 60L ? 60L : secs) as Integer, "radarTrustExpired", [overwrite: true])
+}
+
+/**
+ * No motion sensor has fired for radarTrustMinutes while the room is on: whatever the radars see, start the presence
+ * timeout. presenceTimedOut no longer counts them, so the room goes off unless something moves first.
+ */
+def radarTrustExpired() {
+    if (radarTrusted()) { armRadarTrust(); return }
+    if (!state.presenceActive || state.pendingPresenceOff) return
+    long quiet = (now() - ((state.lastPirAt ?: 0L) as Long)) / 60000L
+    Integer mins = (presenceTimeout ?: 8) as Integer
+    log.warn "No motion sensor has fired in ${quiet} min; only the presence radars say somebody is here (kitchen ${kitchenPresence?.currentValue('roomState') ?: '-'}, living room mmWave ${livingRoomPresence?.currentValue('mmwave') ?: '-'}) - not trusting them, starting the ${mins}-minute presence timeout"
+    state.pendingPresenceOff = true
+    runIn(mins * 60, presenceTimedOut)
+}
+
 /** A zone member reported motion: the zone is not quiet, so the watchdog stands down. */
 def zoneMemberActiveHandler(evt) {
     unschedule("zoneWatchdog")
@@ -1285,7 +1348,7 @@ def zoneWatchdog() {
 /** Any zone member reporting motion, counting the Athom only while it is alive. */
 boolean anyZoneMemberActive() {
     if (anyLiveSensorActive()) return true
-    return livingRoomPresence && !isAthomStale() && livingRoomPresence.currentMotion == "active"
+    return livingRoomPresence && !isAthomStale() && livingRoomPresence.currentMotion == "active" && radarTrusted()
 }
 
 def kzDimCheck() {
