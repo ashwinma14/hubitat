@@ -6,6 +6,10 @@
  *
  *  Author: Claude (for Ashwin)
  *  Date: 2026-02-12
+ *  Version: 1.63 - dawn curve: after predawn every light moves from its predawn level to its scene level, and the color
+ *                  from the predawn value to the scene's, together; the clock completes it in morningRampMinutes and
+ *                  outdoor light can run ahead (complete at dawnFullLux); it never steps back. Before, the predawn end was
+ *                  a step to 30% of the day scene (dining on at 50%, color 2200 -> 2700 K) and then a clock-only ramp
  *  Version: 1.62 - the presence radars (kitchen FP1E, living-room mmWave) hold the room only while a motion sensor has
  *                  fired within radarTrustMinutes (120): on 2026-11-13 the kitchen radar reported somebody from 22:08 to
  *                  04:30 with nobody there and kept the wind-down lights on all night; motion after staleSceneMinutes
@@ -144,7 +148,7 @@ preferences {
     page(name: "mainPage")
 }
 
-def appVersion() { return "1.62" }
+def appVersion() { return "1.63" }
 
 def mainPage() {
     dynamicPage(name: "mainPage", title: "Great Room Lighting Controller", install: true, uninstall: true) {
@@ -277,7 +281,8 @@ def mainPage() {
             input "ambientFadeSeconds", "number", title: "Fade for ambient steps (seconds)", defaultValue: 45, required: true, width: 4
             input "sceneFadeSeconds", "number", title: "Fade for scene changes (seconds)", defaultValue: 3, required: true, width: 4
             input "predawnSunriseOffset", "number", title: "Predawn ends this many minutes before sunrise when that comes earlier than the predawn end time above (it never runs later than that time)", defaultValue: 20, required: true, width: 6
-            input "morningRampMinutes", "number", title: "Minutes to ramp from predawn levels to full once predawn ends", defaultValue: 30, required: true, width: 6
+            input "morningRampMinutes", "number", title: "Dawn curve: minutes from the predawn levels to the full scene once predawn ends, at the latest (brightness and color move together)", defaultValue: 30, required: true, width: 6
+            input "dawnFullLux", "number", title: "Dawn curve: outdoor lux at which it is complete whatever the clock says, so a clear morning runs ahead of the clock (0 = clock only)", defaultValue: 50, required: true, width: 6
             input "daytimeOnDebounceMinutes", "number", title: "Daytime with bright outdoors: the dark-room condition must hold this many minutes before the lights turn on", defaultValue: 10, required: true, width: 4
             input "duskLuxThreshold", "number", title: "...but once outdoor lux is below this, use the shorter dusk debounce", defaultValue: 1000, required: true, width: 4
             input "duskDebounceMinutes", "number", title: "Dusk debounce (minutes)", defaultValue: 3, required: true, width: 4
@@ -714,7 +719,7 @@ def predawnEnded() {
     clearOverrides("predawn ended")
     if (adaptiveEnabled != false) {
         state.morningRamp = [start: now(), minutes: (morningRampMinutes ?: 30) as Integer]
-        log.info "Predawn ended - ramping up over ${morningRampMinutes ?: 30} minutes"
+        log.info "Predawn ended - dawn curve to the full scene over ${morningRampMinutes ?: 30} minutes at most (sooner if it gets light outside)"
         runIn(180, "morningRampStep")
     }
     if (state.presenceActive && !state.tvTimeActive) {
@@ -728,12 +733,12 @@ def morningRampStep() {
     if (rf >= 100) {
         state.morningRamp = null
         state.rampFloor = null
-        log.info "Morning ramp complete"
+        log.info "Dawn curve complete"
     } else {
         runIn(180, "morningRampStep")
     }
     if (state.presenceActive && state.lightNeeded && !state.tvTimeActive && state.currentScene in ["day", "night"]) {
-        reapplyCurrentScene("morning ramp ${rf}%", (ambientFadeSeconds ?: 45) as Integer)
+        reapplyCurrentScene("dawn curve ${((dawnProgress() * 100) as Integer)}%", (ambientFadeSeconds ?: 45) as Integer)
     }
 }
 
@@ -1480,6 +1485,10 @@ def applyLrZoneLevel(Boolean occupied) {
     String kind = sceneForNow()
     def fullLevel = kind == "predawn" ? (predawnHueLevel ?: 30) : kind == "winddown" ? (windDownHueLevel ?: 50) : kind == "night" ? (nightHueLevel ?: 80) : (dayHueLevel ?: 100)
     def lrLevel = scaled(occupied ? fullLevel : ((fullLevel * 50 / 100) as Integer))
+    if (kind == "day") {
+        Integer preLr = (predawnHueLevel ?: 30) as Integer
+        lrLevel = floored(lrHueLights, dawnBlend(occupied ? preLr : ((preLr * 50 / 100) as Integer), lrLevel as Integer))
+    }
     if (occupied) {
         state.lastLrBrightenTime = now()
     }
@@ -1910,20 +1919,73 @@ Integer nextBandDown(Integer factor) {
     return 35
 }
 
-/** Morning ramp: 30% of scene levels when predawn ends, rising to 100% over morningRampMinutes. 100 when no ramp is running. */
-Integer rampFactor() {
-    if (!state.morningRamp) return 100
-    long elapsed = now() - ((state.morningRamp.start ?: 0) as Long)
-    Integer mins = (state.morningRamp.minutes ?: 30) as Integer
-    if (mins <= 0) return 100
-    return Math.min(100, (30 + (70 * elapsed / (mins * 60000L))) as Integer)
+/**
+ * Dawn curve (v1.63): how far the morning has come from the predawn levels (0) to the full scene (1). The clock carries
+ * it from the predawn end over morningRampMinutes; outdoor light can run ahead of the clock (complete at dawnFullLux,
+ * where the ambient bands take over); it never goes back, so a noisy dawn reading cannot dip the room. 1 when no curve
+ * is running. Until v1.62 the morning was a step from the predawn levels to 30% of the day scene (the dining came on at
+ * 50% and the color jumped from 2200 K to 2700 K at that minute), then a clock-only ramp of the factor.
+ */
+BigDecimal dawnProgress() {
+    Map r = state.morningRamp as Map
+    if (!r) return 1.0
+    Integer mins = (r.minutes ?: 30) as Integer
+    BigDecimal clock = mins <= 0 ? 1.0 : (now() - ((r.start ?: 0) as Long)) / (mins * 60000.0)
+    BigDecimal light = 0.0
+    BigDecimal fullLux = (dawnFullLux != null ? dawnFullLux : 50) as BigDecimal
+    def lux = outdoorLuxSensor?.currentIlluminance
+    if (fullLux > 0 && lux != null) light = (lux as BigDecimal) / fullLux
+    BigDecimal best = (r.best ?: 0.0) as BigDecimal
+    BigDecimal prog = [clock, light, best].max()
+    prog = prog < 0.0 ? 0.0 : (prog > 1.0 ? 1.0 : prog)
+    if (prog > best + 0.005) { r.best = prog; state.morningRamp = r }
+    return prog
 }
 
-/** Ambient factor, raised to the dark-room floor while one is set (the room already measured dark), capped by the morning ramp. */
+boolean dawnRunning() {
+    return state.morningRamp != null && dawnProgress() < 1.0
+}
+
+/** A level on the dawn curve: from the predawn level to the scene's own. The scene's level when no curve is running. */
+Integer dawnBlend(Number predawnLevel, Integer full) {
+    if (!state.morningRamp) return full
+    BigDecimal prog = dawnProgress()
+    if (prog >= 1.0) return full
+    BigDecimal pre = (predawnLevel ?: 0) as BigDecimal
+    return Math.round((pre + (full - pre) * prog) as double) as Integer
+}
+
+/** The dining Edisons are off in predawn and dim poorly: they join a quarter of the way along, at 30% or more. */
+Integer dawnDining(Integer full) {
+    if (!state.morningRamp) return full
+    BigDecimal prog = dawnProgress()
+    if (prog >= 1.0) return full
+    if (prog < 0.25) return 0
+    return Math.min(full, Math.max(30, Math.round((full * prog) as double) as Integer))
+}
+
+/** The cans on the dawn curve: a dimmer blends from its predawn level; an on/off switch joins halfway. */
+Integer dawnCans(Integer full) {
+    if (!state.morningRamp) return full
+    Integer pre = cansDimmable() ? ((predawnCansLevel ?: 0) as Integer) : 0
+    if (cansDimmable()) return dawnBlend(pre, full)
+    return dawnProgress() >= 0.5 ? full : 0
+}
+
+/** The dawn curve as the old ramp percentage (30 at the predawn end, 100 when complete or when none is running). */
+Integer rampFactor() {
+    if (!state.morningRamp) return 100
+    return Math.min(100, (30 + 70 * dawnProgress()) as Integer)
+}
+
+/**
+ * Ambient factor, raised to the dark-room floor while one is set (the room already measured dark). The dawn curve no
+ * longer caps it: the scenes blend each light from its predawn level instead (dawnBlend).
+ */
 Integer effectiveFactor() {
     Integer ambient = ambientFactor()
     Integer floor = (state.factorFloor ?: 0) as Integer
-    return Math.min(Math.max(ambient, floor), rampFactor())
+    return Math.max(ambient, floor)
 }
 
 /** Dining Edisons dim poorly, so they step 50 / 75 / 100 with the factor instead of scaling continuously. */
@@ -2063,6 +2125,11 @@ Integer sceneKelvin(String scene) {
     Integer f = ((state.ambientFactor ?: ambientFactor(false)) ?: 100) as Integer
     f = Math.max(35, Math.min(100, f))
     BigDecimal k = day + (night - day) * (f - 35) / 65.0
+    if (state.morningRamp) {
+        // the color rides the dawn curve too, from the predawn value
+        BigDecimal pre = (predawnKelvin ?: 2200) as BigDecimal
+        k = pre + (k - pre) * dawnProgress()
+    }
     return ((Math.round(k / 100.0) as Integer) * 100) as Integer
 }
 
@@ -2187,13 +2254,16 @@ def applyDayScene(Number fadeOverride = null) {
     // Check if living room is occupied (default to true if sensor not configured)
     def lrOccupied = livingRoomOccupied()
     def lrFull = dayHueLevel ?: 100
-    Integer lrLevel = floored(lrHueLights, scaled(lrOccupied ? lrFull : ((lrFull * 50 / 100) as Integer)))
-    Integer hallwayLevel = floored(hallwaySwitch, scaled(dayHallwayLevel ?: 99))
-    Integer pendantLevel = floored(kitchenPendant, scaled(dayKitchenPendantLevel ?: 100))
+    // While the dawn curve runs, every light sits between its predawn level and its scene level (dawnBlend)
+    Integer preLr = (predawnHueLevel ?: 30) as Integer
+    Integer lrLevel = floored(lrHueLights, dawnBlend(lrOccupied ? preLr : ((preLr * 50 / 100) as Integer), scaled(lrOccupied ? lrFull : ((lrFull * 50 / 100) as Integer))))
+    Integer hallwayLevel = floored(hallwaySwitch, dawnBlend(predawnHallwayLevel ?: 20, scaled(dayHallwayLevel ?: 99)))
+    Integer pendantLevel = floored(kitchenPendant, dawnBlend(predawnKitchenPendantLevel ?: 10, scaled(dayKitchenPendantLevel ?: 100)))
+    Integer bookcaseLevel = dawnBlend(predawnBookcaseLevel ?: 10, scaled(dayBookcaseLevel ?: 50))
 
     // Dining Edisons step 50 / 75 / 100 with the factor; a light brightened mid-ramp keeps its floor
-    Integer diningLevel = floored(diningSwitch, diningLevelFor(factor))
-    Integer cansLevel = floored(kitchenCans, cansLevelFor(factor, dayCansLevel ?: 100))
+    Integer diningLevel = floored(diningSwitch, dawnDining(diningLevelFor(factor)))
+    Integer cansLevel = floored(kitchenCans, dawnCans(cansLevelFor(factor, dayCansLevel ?: 100)))
     state.kzFull = [hallway: hallwayLevel, pendant: pendantLevel, dining: diningLevel, cans: cansLevel]
 
     // Kitchen zone still quiet: keep it dimmed through this re-apply
@@ -2209,18 +2279,18 @@ def applyDayScene(Number fadeOverride = null) {
     setLevelSmooth(kitchenPendant, pendantLevel, fade)
     
     // Living Room zone - only ceiling dims when unoccupied, bookcase stays constant
-    setLevelSmooth(bookcaseGOLamp, scaled(dayBookcaseLevel ?: 50), fade)
-    setLevelSmooth(bookcaseColorLamp, scaled(dayBookcaseLevel ?: 50), fade)
+    setLevelSmooth(bookcaseGOLamp, bookcaseLevel, fade)
+    setLevelSmooth(bookcaseColorLamp, bookcaseLevel, fade)
     setLevelSmooth(lrHueLights, lrLevel, fade)
     state.lrDimmed = !lrOccupied
-    applySceneColor("day", [lr: lrLevel, bookcase: scaled(dayBookcaseLevel ?: 50), pendant: pendantLevel])
+    applySceneColor("day", [lr: lrLevel, bookcase: bookcaseLevel, pendant: pendantLevel])
     
     activatorSwitch?.on()
     state.currentScene = "day"
     state.lastFactor = factor
     rememberLevels([lr: lrLevel, hallway: state.kzFull.hallway, dining: state.kzFull.dining, cans: state.kzFull.cans])
 
-    log.info "Day scene applied (factor ${factor}%, fade ${fade}s${kzDim ? ', kitchen zone dimmed' : ''}, LR ${lrOccupied ? 'occupied' : 'unoccupied'} ${lrLevel}%, hallway ${hallwayLevel}%, dining ${diningLevel}%, cans ${cansText(cansLevel)})"
+    log.info "Day scene applied (${state.morningRamp ? 'dawn ' + ((dawnProgress() * 100) as Integer) + '%, ' : ''}factor ${factor}%, fade ${fade}s${kzDim ? ', kitchen zone dimmed' : ''}, LR ${lrOccupied ? 'occupied' : 'unoccupied'} ${lrLevel}%, hallway ${hallwayLevel}%, dining ${diningLevel}%, cans ${cansText(cansLevel)})"
 }
 
 def applyNightScene(Number fadeOverride = null) {
