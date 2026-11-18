@@ -6,6 +6,7 @@
  *
  *  Author: Claude (for Ashwin)
  *  Date: 2026-02-12
+ *  Version: 1.64 - the door from the garage into the house lights an empty, dark downstairs the moment it opens
  *  Version: 1.63 - dawn curve: after predawn every light moves from its predawn level to its scene level, and the color
  *                  from the predawn value to the scene's, together; the clock completes it in morningRampMinutes and
  *                  outdoor light can run ahead (complete at dawnFullLux); it never steps back. Before, the predawn end was
@@ -148,7 +149,7 @@ preferences {
     page(name: "mainPage")
 }
 
-def appVersion() { return "1.63" }
+def appVersion() { return "1.64" }
 
 def mainPage() {
     dynamicPage(name: "mainPage", title: "Great Room Lighting Controller", install: true, uninstall: true) {
@@ -161,6 +162,7 @@ def mainPage() {
             input "kitchenPresence", "capability.motionSensor", title: "Kitchen Presence Sensor (FP1E - for true presence)", required: false
             input "exitSensors", "capability.motionSensor", title: "Exit sensors (the stairs): motion here after the living room last moved means somebody left it, with no grace period", required: false, multiple: true
             input "exitDoors", "capability.contactSensor", title: "Exit doors (the front door): opening after the living room last moved means somebody left it", required: false, multiple: true
+            input "garageEntryDoor", "capability.contactSensor", title: "Door from the garage into the house: opening it while the downstairs is empty and dark lights the room at once", required: false
             input "garageDoor", "capability.garageDoorControl", title: "Garage door: opening it while the downstairs is empty and dark lights the room for the walk in", required: false
             input "indoorLuxSensor", "capability.illuminanceMeasurement", title: "Indoor Lux Sensor (for dark room detection)", required: false
             input "indoorLuxSensor2", "capability.illuminanceMeasurement", title: "Second indoor lux sensor (true-lux sensor such as the kitchen Hue motion sensor; the room counts as dark when EITHER sensor says so)", required: false
@@ -386,6 +388,7 @@ def initialize() {
     if (exitSensors) subscribe(exitSensors, "motion.active", exitHandler)
     if (exitDoors) subscribe(exitDoors, "contact.open", exitHandler)
     if (garageDoor) subscribe(garageDoor, "door", garageDoorHandler)
+    if (garageEntryDoor) subscribe(garageEntryDoor, "contact.open", garageEntryHandler)
     // A dimmed kitchen zone stays dimmed across a restart, like the factor and the morning ramp below: an app update
     // never steps the lights (every Done press used to bring a quiet kitchen back to full for five minutes)
     state.kzDimmed = (state.kzDimmed == true && roomIsOn() && !kzActive())
@@ -1157,6 +1160,23 @@ def garageDoorHandler(evt) {
     // After Garage Door Blink's 4 s signal on the pendant: the bridge puts the pendant back as it was when the signal
     // ends, and a scene sent in the middle of it could be undone
     runIn(6, "garageArrival")
+}
+
+/**
+ * The door from the garage into the house (v1.64): the same arrival, at the moment somebody actually walks in. It also
+ * covers coming in when the big door was already open, or after a long spell in the garage. A departure passes the
+ * kitchen sensors first, as above.
+ */
+def garageEntryHandler(evt) {
+    if (appPaused || state.presenceActive || state.tvTimeActive) return
+    long kzQuiet = now() - ((state.kzLastMotionAt ?: 0L) as Long)
+    if (kzQuiet < 5 * 60000L) { logDebug "${evt.displayName} open: the kitchen side moved ${(kzQuiet / 1000) as Long} s ago - a departure, not an arrival"; return }
+    if (now() - ((state.garageArrivalAt ?: 0L) as Long) < 6000L) return     // the big door's arrival is about to run, after the pendant signal
+    if (!isLightNeeded()) { logDebug "${evt.displayName} open: light not needed - nothing to do"; return }
+    state.garageArrivalAt = now()
+    unschedule("garageArrival")
+    log.info "${evt.displayName} opened with the downstairs empty and dark - lighting the room"
+    garageArrival()
 }
 
 def garageArrival() {
