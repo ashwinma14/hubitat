@@ -6,6 +6,8 @@
  *
  *  Author: Claude (for Ashwin)
  *  Date: 2026-02-12
+ *  Version: 1.65 - the dawn curve takes at least dawnMinMinutes (10): on a weekend predawn ends after first light, and the
+ *                  curve started at 84% in one 3-second step; it steps every minute while daylight leads the clock
  *  Version: 1.64 - the door from the garage into the house lights an empty, dark downstairs the moment it opens
  *  Version: 1.63 - dawn curve: after predawn every light moves from its predawn level to its scene level, and the color
  *                  from the predawn value to the scene's, together; the clock completes it in morningRampMinutes and
@@ -149,7 +151,7 @@ preferences {
     page(name: "mainPage")
 }
 
-def appVersion() { return "1.64" }
+def appVersion() { return "1.65" }
 
 def mainPage() {
     dynamicPage(name: "mainPage", title: "Great Room Lighting Controller", install: true, uninstall: true) {
@@ -284,6 +286,7 @@ def mainPage() {
             input "sceneFadeSeconds", "number", title: "Fade for scene changes (seconds)", defaultValue: 3, required: true, width: 4
             input "predawnSunriseOffset", "number", title: "Predawn ends this many minutes before sunrise when that comes earlier than the predawn end time above (it never runs later than that time)", defaultValue: 20, required: true, width: 6
             input "morningRampMinutes", "number", title: "Dawn curve: minutes from the predawn levels to the full scene once predawn ends, at the latest (brightness and color move together)", defaultValue: 30, required: true, width: 6
+            input "dawnMinMinutes", "number", title: "Dawn curve: never faster than this many minutes, even when it is already light outside as predawn ends (weekends)", defaultValue: 10, required: true, width: 6
             input "dawnFullLux", "number", title: "Dawn curve: outdoor lux at which it is complete whatever the clock says, so a clear morning runs ahead of the clock (0 = clock only)", defaultValue: 50, required: true, width: 6
             input "daytimeOnDebounceMinutes", "number", title: "Daytime with bright outdoors: the dark-room condition must hold this many minutes before the lights turn on", defaultValue: 10, required: true, width: 4
             input "duskLuxThreshold", "number", title: "...but once outdoor lux is below this, use the shorter dusk debounce", defaultValue: 1000, required: true, width: 4
@@ -466,7 +469,7 @@ def initialize() {
     }
     // Keep a morning ramp that is still running across an app update; otherwise a deploy mid-ramp jumps the room to 100%
     if (state.morningRamp && rampFactor() < 100) {
-        runIn(180, "morningRampStep")
+        runIn(dawnStepSeconds(), "morningRampStep")
     } else {
         state.morningRamp = null
     }
@@ -723,7 +726,7 @@ def predawnEnded() {
     if (adaptiveEnabled != false) {
         state.morningRamp = [start: now(), minutes: (morningRampMinutes ?: 30) as Integer]
         log.info "Predawn ended - dawn curve to the full scene over ${morningRampMinutes ?: 30} minutes at most (sooner if it gets light outside)"
-        runIn(180, "morningRampStep")
+        runIn(dawnStepSeconds(), "morningRampStep")
     }
     if (state.presenceActive && !state.tvTimeActive) {
         evaluateLighting("predawn window ended")
@@ -738,7 +741,7 @@ def morningRampStep() {
         state.rampFloor = null
         log.info "Dawn curve complete"
     } else {
-        runIn(180, "morningRampStep")
+        runIn(dawnStepSeconds(), "morningRampStep")
     }
     if (state.presenceActive && state.lightNeeded && !state.tvTimeActive && state.currentScene in ["day", "night"]) {
         reapplyCurrentScene("dawn curve ${((dawnProgress() * 100) as Integer)}%", (ambientFadeSeconds ?: 45) as Integer)
@@ -1957,9 +1960,28 @@ BigDecimal dawnProgress() {
     if (fullLux > 0 && lux != null) light = (lux as BigDecimal) / fullLux
     BigDecimal best = (r.best ?: 0.0) as BigDecimal
     BigDecimal prog = [clock, light, best].max()
+    // Speed limit (v1.65): however light it already is outside, the curve takes at least dawnMinMinutes from its start.
+    // 2026-11-21, a Saturday: predawn ended at 07:30 with 42 lux outside and the room went to 84% in three seconds
+    BigDecimal minMins = (dawnMinMinutes != null ? dawnMinMinutes : 10) as BigDecimal
+    if (minMins > 0) {
+        BigDecimal cap = (now() - ((r.start ?: 0) as Long)) / (minMins * 60000.0)
+        if (prog > cap) prog = [cap, clock].max()
+    }
     prog = prog < 0.0 ? 0.0 : (prog > 1.0 ? 1.0 : prog)
     if (prog > best + 0.005) { r.best = prog; state.morningRamp = r }
     return prog
+}
+
+/** Seconds to the next step of the dawn curve: every minute while daylight is pulling it ahead of the clock, else every three. */
+Integer dawnStepSeconds() {
+    Map r = state.morningRamp as Map
+    if (!r) return 180
+    Integer mins = (r.minutes ?: 30) as Integer
+    BigDecimal clock = mins <= 0 ? 1.0 : (now() - ((r.start ?: 0) as Long)) / (mins * 60000.0)
+    BigDecimal fullLux = (dawnFullLux != null ? dawnFullLux : 50) as BigDecimal
+    def lux = outdoorLuxSensor?.currentIlluminance
+    BigDecimal light = (fullLux > 0 && lux != null) ? (lux as BigDecimal) / fullLux : 0.0
+    return light > clock + 0.02 ? 60 : 180
 }
 
 boolean dawnRunning() {
